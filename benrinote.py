@@ -8,10 +8,6 @@
 # - メモA/B：左右分割、白背景、リッチ編集、下端に少し余白
 # - ツールバー：『常に手前に表示』トグル（起動時は必ずOFF）
 # - トレイ：表示/最小化/終了、『常に手前に表示』トグル
-# - ツールバーのダブルクリックで「前回サイズ ↔ 画面70%」トグル
-# - × がグレーで押せなくなる問題を回避（setWindowFlag のピンポイント切替＋標準ボタン確保）
-#
-# 先生コメント（学習のポイント）は重要箇所に入れています。
 # =========================================================
 
 from __future__ import annotations
@@ -403,7 +399,7 @@ class MainWindow(QtWidgets.QMainWindow):
         return super().eventFilter(obj, event)
 
     def _toggle_size_70(self):
-        # 先生コメント：最大化中は一旦通常に戻してから、70%サイズ or 前回サイズへ。
+        # 最大化中は一旦通常に戻してから、70%サイズ or 前回サイズへ。
         if self.isMaximized():
             self.showNormal()
         avail = QtGui.QGuiApplication.primaryScreen().availableGeometry()
@@ -447,7 +443,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._apply_on_top(bool(on))
 
     def _apply_on_top(self, on: bool, first_time: bool = False):
-        # 先生コメント（超重要）：
         # - setWindowFlag(Qt.WindowStaysOnTopHint, on) で“そのフラグだけ”を切り替える。
         # - 標準ボタン（×/最小/最大）を常に有効化して、グレー化を防ぐ。
         # - show() / raise_() / activateWindow() で枠を安定再描画。
@@ -467,7 +462,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.actOnTop.blockSignals(True); self.actOnTop.setChecked(False); self.actOnTop.blockSignals(False)
 
     def _force_standard_window_buttons(self):
-        # 先生コメント：
         # WindowCloseButtonHint / WindowMinMaxButtonsHint を常に True に固定。
         # これで OnTop 切替後も「×」が押せる状態を維持しやすい。
         self.setWindowFlag(QtCore.Qt.Window, True)
@@ -666,4 +660,5 @@ def main():
     sys.exit(app.exec())
 
 if __name__ == "__main__":
+
     main()
