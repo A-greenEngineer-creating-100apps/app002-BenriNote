@@ -41,3 +41,15 @@ PySide6 で作った「軽量ノートアプリ」です。   「ちょっとし
 - [PySide6](https://pypi.org/project/PySide6/)
 - PySide6>=6.6
 
+### セットアップ
+
+```bash
+git clone https://github.com/<yourname>/benrinote.git
+cd benrinote
+pip install -r requirements.txt
+python benrinote.py
+
+## 備忘メモ
+
+- Python 環境がなくても使えるようにする（PyInstaller などで EXE 化を検討？）
+- アイコンやテーマの追加、UIもっとおしゃれにすること。
