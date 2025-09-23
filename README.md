@@ -48,6 +48,7 @@ git clone https://github.com/<yourname>/benrinote.git
 cd benrinote
 pip install -r requirements.txt
 python benrinote.py
+```
 
 ## 備忘メモ
 
