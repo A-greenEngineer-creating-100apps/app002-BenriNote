@@ -4,8 +4,9 @@
 #
 # 機能：
 # - ToDo：ダブルクリック編集（リッチ）、完了→アーカイブ、アーカイブ編集/削除（タブ切替）
-# - 常駐事項：ドラッグ&ドロップで並べ替え、ダブルクリックでリッチ編集ポップアップ
-# - メモA/B：左右分割、白背景、リッチ編集、下端に少し余白
+# - 常駐事項：タブ（カテゴリ）内に“項目”のリスト（追加・改名・削除・ドラッグ並べ替え）
+#              項目はダブルクリックでリッチ編集ポップアップ
+# - メモA/B：左右分割、白背景、リッチ編集
 # - ツールバー：『常に手前に表示』トグル（起動時は必ずOFF）
 # - トレイ：表示/最小化/終了、『常に手前に表示』トグル
 # =========================================================
@@ -33,14 +34,20 @@ ACCENT_HOVER  = "#6BA0F6"
 ACCENT_WEAK   = "#E6F0FF"
 FG            = "#222222"
 BG            = "#FAFAFB"
-PANEL_BG      = "#FFFFFF"  # ← メモはホワイトにしたい要望を満たす
+PANEL_BG      = "#FFFFFF"
 BORDER        = "#E6E6EA"
 HANDLE        = "#EAEAEA"
 
+# state 仕様
+# categories: {
+#   "<category_name>": {
+#       "items": [ { "id": "...", "title": "項目名", "html": "<p>..</p>" }, ... ]
+#   }, ...
+# }
 DEFAULT_STATE = {
-    "categories": {},           # name -> {"html": "..."}
+    "categories": {},
     "category_order": [],
-    "todo": {"items": [], "archive": []},  # item: {id, text, done, html, archived_at?}
+    "todo": {"items": [], "archive": []},
     "memo1": {"html": ""},
     "memo2": {"html": ""},
 }
@@ -89,7 +96,7 @@ def install_excepthook():
             pass
     sys.excepthook = _hook
 
-# ---------- Icons（簡易生成） ----------
+# ---------- RichBar（メモ等の簡易リッチ編集バー） ----------
 def make_icon_A_underline(size=18) -> QtGui.QIcon:
     pm = QtGui.QPixmap(size, size); pm.fill(QtCore.Qt.GlobalColor.transparent)
     p = QtGui.QPainter(pm); p.setRenderHint(QtGui.QPainter.Antialiasing, True)
@@ -115,7 +122,6 @@ def make_icon_palette(color: QtGui.QColor, size=18) -> QtGui.QIcon:
     p.drawEllipse(QtCore.QRectF(size*0.18, size*0.22, size*0.28, size*0.28))
     p.end(); return QtGui.QIcon(pm)
 
-# ---------- RichBar ----------
 class RichBar(QtWidgets.QToolBar):
     htmlChanged = QtCore.Signal()
     def __init__(self, target: QtWidgets.QTextEdit, parent=None):
@@ -178,7 +184,7 @@ class HtmlEditDialog(QtWidgets.QDialog):
         self.editor.setHtml(html or "")
         self.editor.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
         self.editor.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
-        self.editor.setStyleSheet(f"QTextEdit{{background:{PANEL_BG};}}")  # 白背景
+        self.editor.setStyleSheet(f"QTextEdit{{background:{PANEL_BG};}}")
         bar = RichBar(self.editor)
         btnBox = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
         btnBox.accepted.connect(self.accept); btnBox.rejected.connect(self.reject)
@@ -187,14 +193,17 @@ class HtmlEditDialog(QtWidgets.QDialog):
 
 # ---------- Main Window ----------
 class MainWindow(QtWidgets.QMainWindow):
-    def __init__(self):
+    def __init__(self, app_icon: QtGui.QIcon):
         super().__init__()
+        self.app_icon = app_icon
         self.setWindowTitle(APP_TITLE)
-        self.setWindowIcon(QtGui.QIcon.fromTheme("sticky-notes"))
+        self.setWindowIcon(self.app_icon)
         self.prev_geometry: QtCore.QRect | None = None
 
+        # 状態読み込み & マイグレーション
         self.state = load_json(DATA_FILE, DEFAULT_STATE)
-        self.conf  = load_json(CONF_FILE, {"geometry": None})  # ← always_on_top は保存・復元しない
+        self._migrate_categories_to_items()
+        self.conf  = load_json(CONF_FILE, {"geometry": None})
 
         # Global style
         self._apply_global_style()
@@ -213,16 +222,13 @@ class MainWindow(QtWidgets.QMainWindow):
         """)
         self.addToolBar(QtCore.Qt.TopToolBarArea, self.topBar)
 
-        # 『常に手前』は起動時OFF固定（保存・復元しない）
         self.actOnTop = QtGui.QAction("常に手前に表示", self, checkable=True, checked=False)
         self.actOnTop.toggled.connect(self._toggle_always_on_top)
         btnOnTop = QtWidgets.QToolButton(); btnOnTop.setDefaultAction(self.actOnTop); btnOnTop.setCheckable(True)
         self.topBar.addWidget(btnOnTop)
+        self.topBar.installEventFilter(self)  # ダブルクリックで 70% サイズ↔前回サイズ
 
-        # ダブルクリックで 70%サイズトグル
-        self.topBar.installEventFilter(self)
-
-        # ===== Left Top: ToDo / Archive Tabs =====
+        # ===== Left Top: ToDo / Archive =====
         self.todoModel = TodoModel(self.state["todo"]["items"])
         self.todoList  = QtWidgets.QListView(); self.todoList.setModel(self.todoModel)
         self.todoList.doubleClicked.connect(self._edit_todo_item)
@@ -243,43 +249,40 @@ class MainWindow(QtWidgets.QMainWindow):
         hb2 = QtWidgets.QHBoxLayout(); hb2.addWidget(btnTgl); hb2.addWidget(btnArc); hb2.addWidget(btnDel)
         vct.addLayout(hb2)
 
-        # Archive（タブで切替）
+        # Archive
         self.archiveList = QtWidgets.QListWidget(); self._refresh_archive_list()
         self.archiveList.itemDoubleClicked.connect(self._edit_archive_item)
         btnArcDel = QtWidgets.QPushButton("選択アーカイブ削除")
         btnArcDel.clicked.connect(self._delete_selected_archive)
         arcPane = QtWidgets.QWidget(); varc = QtWidgets.QVBoxLayout(arcPane)
-        varc.setContentsMargins(8,8,8,8)
-        varc.addWidget(self.archiveList)
+        varc.setContentsMargins(8,8,8,8); varc.addWidget(self.archiveList)
         varc.addWidget(btnArcDel, alignment=QtCore.Qt.AlignRight)
 
         self.centerTabs = QtWidgets.QTabWidget()
         self.centerTabs.addTab(todoPane, "ToDo")
         self.centerTabs.addTab(arcPane, "アーカイブ")
 
-        # ===== Left Bottom: 常駐事項 =====
-        self.categoryList = QtWidgets.QListWidget()
-        self.categoryList.setDragEnabled(True)
-        self.categoryList.setAcceptDrops(True)
-        self.categoryList.setDefaultDropAction(QtCore.Qt.MoveAction)
-        self.categoryList.setDragDropMode(QtWidgets.QAbstractItemView.InternalMove)  # D&D 並べ替え
-        self.categoryList.model().rowsMoved.connect(self._on_category_rows_moved)
-        self._reload_category_list()
-        self.categoryList.itemDoubleClicked.connect(self._open_category_popup)
+        # ===== Left Bottom: 常駐事項（カテゴリ＝タブ）=====
+        self.residentTabs = QtWidgets.QTabWidget()
+        self.residentTabs.setTabsClosable(False)
+        self.residentTabs.tabBar().setMovable(True)  # ドラッグ並べ替え
+        self.residentTabs.tabBar().installEventFilter(self)
 
-        btnAdd = QtWidgets.QToolButton(); btnAdd.setText("＋")
-        btnRen = QtWidgets.QToolButton(); btnRen.setText("改")
-        btnDel = QtWidgets.QToolButton(); btnDel.setText("削")
-        btnAdd.clicked.connect(self._add_category)
-        btnRen.clicked.connect(self._rename_category)
-        btnDel.clicked.connect(self._delete_category)
+        # 追加/改名/削除（カテゴリ）
+        btnAddCat = QtWidgets.QToolButton(); btnAddCat.setText("＋"); btnAddCat.clicked.connect(self._add_resident_tab)
+        btnRenCat = QtWidgets.QToolButton(); btnRenCat.setText("改"); btnRenCat.clicked.connect(self._rename_resident_tab)
+        btnDelCat = QtWidgets.QToolButton(); btnDelCat.setText("削"); btnDelCat.clicked.connect(self._delete_resident_tab)
 
         leftBottom = QtWidgets.QWidget()
         vlb = QtWidgets.QVBoxLayout(leftBottom); vlb.setContentsMargins(8,0,8,8)
-        titleCat = QtWidgets.QLabel("常駐事項"); titleCat.setStyleSheet("font-weight: bold; color: %s;" % FG)
+        titleCat = QtWidgets.QLabel("常駐事項")
+        titleCat.setStyleSheet("font-weight: bold; color: %s;" % FG)
         toolRow = QtWidgets.QHBoxLayout(); toolRow.addWidget(titleCat); toolRow.addStretch(1)
-        toolRow.addWidget(btnAdd); toolRow.addWidget(btnRen); toolRow.addWidget(btnDel)
-        vlb.addLayout(toolRow); vlb.addWidget(self.categoryList)
+        toolRow.addWidget(btnAddCat); toolRow.addWidget(btnRenCat); toolRow.addWidget(btnDelCat)
+        vlb.addLayout(toolRow); vlb.addWidget(self.residentTabs)
+
+        # タブの中身を構成（各カテゴリに「項目リストUI」を置く）
+        self._rebuild_resident_tabs()
 
         # Left stack: ToDo (3) / 常駐 (7)
         leftStack = QtWidgets.QWidget()
@@ -288,16 +291,13 @@ class MainWindow(QtWidgets.QMainWindow):
         grid.addWidget(self.centerTabs, 0, 0)
         grid.addWidget(leftBottom,   1, 0)
 
-        # ===== Right: Memo A/B（白背景・左右）=====
+        # ===== Right: Memo A/B =====
         self.memoEditor1 = QtWidgets.QTextEdit(); self.memoEditor1.setAcceptRichText(True)
         self.memoEditor2 = QtWidgets.QTextEdit(); self.memoEditor2.setAcceptRichText(True)
-        # 白背景 & 余白
         for ed in (self.memoEditor1, self.memoEditor2):
             ed.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
             ed.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
             ed.setStyleSheet(f"QTextEdit{{background:{PANEL_BG}; padding:6px; border:1px solid {BORDER}; border-radius:8px;}}")
-
-        # 初期内容
         self.memoEditor1.setHtml(self.state["memo1"]["html"])
         self.memoEditor2.setHtml(self.state["memo2"]["html"])
         self.memoEditor1.textChanged.connect(self._on_memo1_html_changed)
@@ -317,10 +317,8 @@ class MainWindow(QtWidgets.QMainWindow):
         v2.addWidget(lab2); v2.addWidget(memoBar2); v2.addWidget(self.memoEditor2, 1)
 
         rightSplitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
-        rightSplitter.addWidget(memoPane1)
-        rightSplitter.addWidget(memoPane2)
-        rightSplitter.setStretchFactor(0, 1)
-        rightSplitter.setStretchFactor(1, 1)
+        rightSplitter.addWidget(memoPane1); rightSplitter.addWidget(memoPane2)
+        rightSplitter.setStretchFactor(0, 1); rightSplitter.setStretchFactor(1, 1)
         rightSplitter.setChildrenCollapsible(False)
         rightSplitter.setHandleWidth(10)
         rightSplitter.setStyleSheet(f"""
@@ -332,18 +330,14 @@ class MainWindow(QtWidgets.QMainWindow):
             }}
         """)
 
-        # 右全体の下端に少し余白
         rightWrap = QtWidgets.QWidget()
         vrw = QtWidgets.QVBoxLayout(rightWrap)
         vrw.setContentsMargins(0,0,0,8)
         vrw.addWidget(rightSplitter)
 
-        # ===== Whole splitter =====
         splitter = QtWidgets.QSplitter()
-        splitter.addWidget(leftStack)
-        splitter.addWidget(rightWrap)
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 3)
+        splitter.addWidget(leftStack); splitter.addWidget(rightWrap)
+        splitter.setStretchFactor(0, 1); splitter.setStretchFactor(1, 3)
         splitter.setHandleWidth(10)
         splitter.setStyleSheet(f"""
             QSplitter::handle {{
@@ -354,7 +348,7 @@ class MainWindow(QtWidgets.QMainWindow):
         """)
         self.setCentralWidget(splitter)
 
-        # 起動時は必ず「常に手前 OFF」に固定（復元しない）
+        # 起動時は必ず「常に手前 OFF」に固定
         self._force_standard_window_buttons()
         self._apply_on_top(False, first_time=True)
 
@@ -364,6 +358,175 @@ class MainWindow(QtWidgets.QMainWindow):
         # Save timer
         self.saveTimer = QtCore.QTimer(self); self.saveTimer.setInterval(2000)
         self.saveTimer.timeout.connect(self._save_all); self.saveTimer.start()
+
+    # ====== 常駐カテゴリ：データ移行 ======
+    def _migrate_categories_to_items(self):
+        changed = False
+        cats = self.state.get("categories", {})
+        for name, val in list(cats.items()):
+            # 旧仕様：{"html": "..."} → 新仕様：{"items":[{"title":"メモ","html":"..."}]}
+            if isinstance(val, dict) and "items" not in val:
+                html = val.get("html", "")
+                cats[name] = {"items": []}
+                if html:
+                    cats[name]["items"].append({"id": str(uuid.uuid4()), "title": "メモ", "html": html})
+                changed = True
+            else:
+                # items は存在するが title 等が無ければ補完
+                items = cats[name].get("items", [])
+                for it in items:
+                    it.setdefault("id", str(uuid.uuid4()))
+                    it.setdefault("title", "無題")
+                    it.setdefault("html", "")
+        if changed:
+            save_json(DATA_FILE, self.state)
+
+    # ====== 常駐カテゴリ：UI 構築 ======
+    def _rebuild_resident_tabs(self):
+        self.residentTabs.blockSignals(True)
+        self.residentTabs.clear()
+        order = list(self.state.get("category_order", []))
+        for k in self.state["categories"].keys():
+            if k not in order: order.append(k)
+        self.state["category_order"] = order
+
+        for name in order:
+            self.residentTabs.addTab(self._build_category_widget(name), name)
+        self.residentTabs.blockSignals(False)
+
+    def _build_category_widget(self, cat_name: str) -> QtWidgets.QWidget:
+        """カテゴリタブの中身：項目リスト + ボタン群。ダブルクリックでポップアップ編集。"""
+        wrap = QtWidgets.QWidget()
+        v = QtWidgets.QVBoxLayout(wrap); v.setContentsMargins(6,6,6,6); v.setSpacing(6)
+
+        lst = QtWidgets.QListWidget(objectName=f"list_{cat_name}")
+        lst.setStyleSheet("QListWidget{background:%s; border:1px solid %s; border-radius:8px;}" % (PANEL_BG, BORDER))
+        lst.setDragDropMode(QtWidgets.QAbstractItemView.InternalMove)  # 並べ替え可
+        lst.setDefaultDropAction(QtCore.Qt.MoveAction)
+        lst.itemDoubleClicked.connect(lambda item, cn=cat_name: self._edit_resident_item(cn, lst.row(item)))
+        lst.model().rowsMoved.connect(lambda *_args, cn=cat_name, w=lst: self._on_resident_item_rows_moved(cn, w))
+
+        # 初期項目を反映
+        for it in self.state["categories"].get(cat_name, {}).get("items", []):
+            lst.addItem(it.get("title", "無題"))
+
+        # ボタン群
+        hb = QtWidgets.QHBoxLayout()
+        btnAdd = QtWidgets.QPushButton("項目追加")
+        btnRen = QtWidgets.QPushButton("項目名変更")
+        btnDel = QtWidgets.QPushButton("項目削除")
+        hb.addWidget(btnAdd); hb.addWidget(btnRen); hb.addWidget(btnDel); hb.addStretch(1)
+
+        btnAdd.clicked.connect(lambda _=None, cn=cat_name, w=lst: self._add_resident_item(cn, w))
+        btnRen.clicked.connect(lambda _=None, cn=cat_name, w=lst: self._rename_resident_item(cn, w))
+        btnDel.clicked.connect(lambda _=None, cn=cat_name, w=lst: self._delete_resident_item(cn, w))
+
+        v.addWidget(lst, 1); v.addLayout(hb)
+        return wrap
+
+    # --- 項目操作 ---
+    def _add_resident_item(self, cat_name: str, list_widget: QtWidgets.QListWidget):
+        title, ok = QtWidgets.QInputDialog.getText(self, "項目の追加", "項目名：")
+        if not ok or not title.strip(): return
+        title = title.strip()
+        item = {"id": str(uuid.uuid4()), "title": title, "html": ""}
+        self.state["categories"][cat_name]["items"].append(item)
+        list_widget.addItem(title)
+        self._save_all()
+
+    def _rename_resident_item(self, cat_name: str, list_widget: QtWidgets.QListWidget):
+        row = list_widget.currentRow()
+        if row < 0: return
+        cur_title = self.state["categories"][cat_name]["items"][row]["title"]
+        new, ok = QtWidgets.QInputDialog.getText(self, "項目名の変更", "新しい名前：", text=cur_title)
+        if not ok: return
+        new = new.strip()
+        if not new: return
+        self.state["categories"][cat_name]["items"][row]["title"] = new
+        list_widget.item(row).setText(new)
+        self._save_all()
+
+    def _delete_resident_item(self, cat_name: str, list_widget: QtWidgets.QListWidget):
+        row = list_widget.currentRow()
+        if row < 0: return
+        title = self.state["categories"][cat_name]["items"][row]["title"]
+        if QtWidgets.QMessageBox.question(self, "削除確認", f"「{title}」を削除しますか？") != QtWidgets.QMessageBox.Yes:
+            return
+        self.state["categories"][cat_name]["items"].pop(row)
+        list_widget.takeItem(row)
+        self._save_all()
+
+    def _on_resident_item_rows_moved(self, cat_name: str, list_widget: QtWidgets.QListWidget):
+        # ListWidget の見た目順に state.items を並べ替える
+        items = self.state["categories"][cat_name]["items"]
+        new_order_titles = [list_widget.item(i).text() for i in range(list_widget.count())]
+        # タイトルが重複する可能性もあるので、安直にタイトル一致で並び替えるのではなく、
+        # 現順 items を走査して new_order_titles の順に並ぶように再構成する
+        title_to_list = {}
+        for it in items:
+            title_to_list.setdefault(it["title"], []).append(it)
+        new_items = []
+        for t in new_order_titles:
+            new_items.append(title_to_list[t].pop(0))
+        self.state["categories"][cat_name]["items"] = new_items
+        self._save_all()
+
+    def _edit_resident_item(self, cat_name: str, row: int):
+        if row < 0: return
+        it = self.state["categories"][cat_name]["items"][row]
+        dlg = HtmlEditDialog(f"{cat_name}：{it['title']}", it.get("html",""), self)
+        if dlg.exec() == QtWidgets.QDialog.Accepted:
+            it["html"] = dlg.get_html()
+            self._save_all()
+
+    # --- カテゴリ（タブ）操作 ---
+    def _on_resident_tab_moved(self, from_idx: int, to_idx: int):
+        new_order = [self.residentTabs.tabText(i) for i in range(self.residentTabs.count())]
+        self.state["category_order"] = new_order
+        self._save_all()
+
+    def _add_resident_tab(self):
+        name, ok = QtWidgets.QInputDialog.getText(self, "カテゴリの追加", "カテゴリ名：")
+        if not ok or not name.strip(): return
+        name = name.strip()
+        if name in self.state["categories"]:
+            QtWidgets.QMessageBox.warning(self, "重複", "同名のカテゴリが既にあります。"); return
+        self.state["categories"][name] = {"items": []}
+        self.state["category_order"].append(name)
+        self._rebuild_resident_tabs()
+        for i in range(self.residentTabs.count()):
+            if self.residentTabs.tabText(i) == name:
+                self.residentTabs.setCurrentIndex(i); break
+        self._save_all()
+
+    def _rename_resident_tab(self):
+        cur = self.residentTabs.currentIndex()
+        if cur < 0: return
+        old = self.residentTabs.tabText(cur)
+        new, ok = QtWidgets.QInputDialog.getText(self, "カテゴリ名の変更", "新しい名前：", text=old)
+        if not ok: return
+        new = new.strip()
+        if not new or new == old: return
+        if new in self.state["categories"]:
+            QtWidgets.QMessageBox.warning(self, "重複", "同名のカテゴリが既にあります。"); return
+        self.state["categories"][new] = self.state["categories"].pop(old)
+        self.state["category_order"] = [new if x == old else x for x in self.state["category_order"]]
+        self._rebuild_resident_tabs()
+        for i in range(self.residentTabs.count()):
+            if self.residentTabs.tabText(i) == new:
+                self.residentTabs.setCurrentIndex(i); break
+        self._save_all()
+
+    def _delete_resident_tab(self):
+        cur = self.residentTabs.currentIndex()
+        if cur < 0: return
+        name = self.residentTabs.tabText(cur)
+        if QtWidgets.QMessageBox.question(self, "削除確認", f"カテゴリ「{name}」を削除しますか？\n（項目も全て消えます）") != QtWidgets.QMessageBox.Yes:
+            return
+        self.state["categories"].pop(name, None)
+        self.state["category_order"] = [x for x in self.state["category_order"] if x != name]
+        self._rebuild_resident_tabs()
+        self._save_all()
 
     # ----- Global style -----
     def _apply_global_style(self):
@@ -392,16 +555,34 @@ class MainWindow(QtWidgets.QMainWindow):
             QScrollBar::handle:horizontal {{ background: {BORDER}; border-radius: 6px; }}
         """)
 
-    # ----- Event filter (double-click topbar to size toggle) -----
+    # ----- Event filter -----
     def eventFilter(self, obj, event):
         if obj is self.topBar and event.type() == QtCore.QEvent.MouseButtonDblClick:
             self._toggle_size_70(); return True
+        if obj is self.residentTabs.tabBar():
+            if event.type() == QtCore.QEvent.MouseButtonDblClick:
+                pos = event.position().toPoint()
+                idx = obj.tabAt(pos)
+                if idx >= 0:
+                    # タブのダブルクリック → 現在選択中の項目を開く…ではなく、
+                    # 項目が無ければ追加、あれば最初の項目を開く（操作導線を用意）
+                    cat = self.residentTabs.tabText(idx)
+                    items = self.state["categories"][cat]["items"]
+                    if not items:
+                        # 初回は項目を1つ作ってすぐ編集
+                        self.state["categories"][cat]["items"].append(
+                            {"id": str(uuid.uuid4()), "title": "メモ", "html": ""}
+                        )
+                        # UIも更新
+                        self._rebuild_resident_tabs()
+                        self._save_all()
+                    # 最初の項目を編集
+                    self._edit_resident_item(cat, 0)
+                    return True
         return super().eventFilter(obj, event)
 
     def _toggle_size_70(self):
-        # 最大化中は一旦通常に戻してから、70%サイズ or 前回サイズへ。
-        if self.isMaximized():
-            self.showNormal()
+        if self.isMaximized(): self.showNormal()
         avail = QtGui.QGuiApplication.primaryScreen().availableGeometry()
         cur = self.geometry()
         target_w, target_h = int(avail.width()*0.7), int(avail.height()*0.7)
@@ -418,13 +599,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ----- Tray -----
     def _setup_tray(self):
-        self.tray = QtWidgets.QSystemTrayIcon(self.windowIcon(), self)
+        self.tray = QtWidgets.QSystemTrayIcon(self.app_icon, self)
+        self.tray.setIcon(self.app_icon)
         menu = QtWidgets.QMenu()
         act_show = menu.addAction("表示／前面へ"); act_hide = menu.addAction("最小化")
         menu.addSeparator()
         self.actTrayOnTop = menu.addAction("常に手前に表示")
         self.actTrayOnTop.setCheckable(True)
-        self.actTrayOnTop.setChecked(False)                     # 起動時は必ずOFF
+        self.actTrayOnTop.setChecked(False)
         self.actTrayOnTop.toggled.connect(self._toggle_always_on_top)
         menu.addSeparator()
         act_quit = menu.addAction("終了")
@@ -434,36 +616,22 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ----- Always on Top -----
     def _toggle_always_on_top(self, on: bool):
-        # ボタン状態同期（相互反映）
         if hasattr(self, "actOnTop") and self.actOnTop.isChecked() != on:
             self.actOnTop.blockSignals(True); self.actOnTop.setChecked(on); self.actOnTop.blockSignals(False)
         if hasattr(self, "actTrayOnTop") and self.actTrayOnTop.isChecked() != on:
             self.actTrayOnTop.blockSignals(True); self.actTrayOnTop.setChecked(on); self.actTrayOnTop.blockSignals(False)
-
         self._apply_on_top(bool(on))
 
     def _apply_on_top(self, on: bool, first_time: bool = False):
-        # - setWindowFlag(Qt.WindowStaysOnTopHint, on) で“そのフラグだけ”を切り替える。
-        # - 標準ボタン（×/最小/最大）を常に有効化して、グレー化を防ぐ。
-        # - show() / raise_() / activateWindow() で枠を安定再描画。
         self.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, on)
         self._force_standard_window_buttons()
-
-        # フラグ変更をOS側に反映
-        if self.isMinimized():
-            self.showNormal()
-        else:
-            self.show()
-
+        if self.isMinimized(): self.showNormal()
+        else: self.show()
         self.raise_(); self.activateWindow()
-
-        # 起動直後は必ずOFFを維持（ツールバー側もOFFに戻す）
         if first_time and hasattr(self, "actOnTop"):
             self.actOnTop.blockSignals(True); self.actOnTop.setChecked(False); self.actOnTop.blockSignals(False)
 
     def _force_standard_window_buttons(self):
-        # WindowCloseButtonHint / WindowMinMaxButtonsHint を常に True に固定。
-        # これで OnTop 切替後も「×」が押せる状態を維持しやすい。
         self.setWindowFlag(QtCore.Qt.Window, True)
         self.setWindowFlag(QtCore.Qt.WindowCloseButtonHint, True)
         self.setWindowFlag(QtCore.Qt.WindowMinMaxButtonsHint, True)
@@ -474,7 +642,6 @@ class MainWindow(QtWidgets.QMainWindow):
         avail = QtGui.QGuiApplication.primaryScreen().availableGeometry()
         if geo:
             rect = QtCore.QRect(*geo)
-            # 画面ほぼいっぱいに広がっていたら70%から開始
             if rect.width() > int(avail.width()*0.98) or rect.height() > int(avail.height()*0.98):
                 self._apply_percent_size(0.7)
             else:
@@ -495,72 +662,6 @@ class MainWindow(QtWidgets.QMainWindow):
         g = self.geometry()
         self.conf["geometry"] = [g.x(), g.y(), g.width(), g.height()]
         save_json(CONF_FILE, self.conf)
-
-    # ----- 常駐事項 -----
-    def _reload_category_list(self):
-        self.categoryList.clear()
-        order = self.state.get("category_order", [])
-        keys  = list(self.state["categories"].keys())
-        for k in keys:
-            if k not in order: order.append(k)
-        self.state["category_order"] = order
-        for name in order:
-            if name in self.state["categories"]:
-                self.categoryList.addItem(name)
-
-    def _on_category_rows_moved(self, *_):
-        new_order = [self.categoryList.item(i).text() for i in range(self.categoryList.count())]
-        self.state["category_order"] = new_order
-        self._save_all()
-
-    def _current_category_name(self):
-        it = self.categoryList.currentItem()
-        return it.text() if it else None
-
-    def _add_category(self):
-        name, ok = QtWidgets.QInputDialog.getText(self, "常駐事項の追加", "名称：")
-        if not ok or not name.strip(): return
-        name = name.strip()
-        if name in self.state["categories"]:
-            QtWidgets.QMessageBox.warning(self, "重複", "同名が既にあります。"); return
-        self.state["categories"][name] = {"html": ""}
-        self.state["category_order"].append(name)
-        self._reload_category_list()
-        items = self.categoryList.findItems(name, QtCore.Qt.MatchExactly)
-        if items: self.categoryList.setCurrentItem(items[0]); self._save_all()
-
-    def _rename_category(self):
-        cur = self._current_category_name()
-        if not cur: return
-        new, ok = QtWidgets.QInputDialog.getText(self, "名称変更", "新しい名称：", text=cur)
-        if not ok: return
-        new = new.strip()
-        if not new: return
-        if new != cur and new in self.state["categories"]:
-            QtWidgets.QMessageBox.warning(self, "重複", "同名が既にあります。"); return
-        self.state["categories"][new] = self.state["categories"].pop(cur)
-        order = self.state["category_order"]
-        self.state["category_order"] = [new if x == cur else x for x in order]
-        self._reload_category_list()
-        items = self.categoryList.findItems(new, QtCore.Qt.MatchExactly)
-        if items: self.categoryList.setCurrentItem(items[0]); self._save_all()
-
-    def _delete_category(self):
-        cur = self._current_category_name()
-        if not cur: return
-        if QtWidgets.QMessageBox.question(self, "削除確認", f"「{cur}」を削除しますか？\n（内容も消えます）") != QtWidgets.QMessageBox.Yes:
-            return
-        self.state["categories"].pop(cur, None)
-        self.state["category_order"] = [x for x in self.state["category_order"] if x != cur]
-        self._reload_category_list(); self._save_all()
-
-    def _open_category_popup(self, item: QtWidgets.QListWidgetItem):
-        name = item.text()
-        html = self.state["categories"].get(name, {}).get("html", "")
-        dlg = HtmlEditDialog(f"常駐事項メモ：{name}", html, self)
-        if dlg.exec() == QtWidgets.QDialog.Accepted:
-            self.state["categories"][name]["html"] = dlg.get_html()
-            self._save_all()
 
     # ----- ToDo -----
     def _add_todo(self):
@@ -651,14 +752,31 @@ class MainWindow(QtWidgets.QMainWindow):
     def _save_all(self):
         save_json(DATA_FILE, self.state)
 
+# ---------- App Icon（QApplication生成後に呼ぶ） ----------
+def make_app_icon(size=128) -> QtGui.QIcon:
+    pm = QtGui.QPixmap(size, size)
+    pm.fill(QtCore.Qt.transparent)
+    p = QtGui.QPainter(pm); p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+    rect = QtCore.QRectF(12, 16, size - 24, size - 28)
+    p.fillRect(rect, QtGui.QColor("#ffffff"))
+    p.setPen(QtGui.QPen(QtGui.QColor("#6BA0F6"), 6)); p.drawRoundedRect(rect, 18, 18)
+    p.setPen(QtGui.QPen(QtGui.QColor("#4F8AF3"), 10))
+    p.drawLine(rect.left() + 18, rect.top() + 36, rect.right() - 18, rect.top() + 36)
+    p.end()
+    return QtGui.QIcon(pm)
+
 # ---------- Entry ----------
 def main():
     install_excepthook()
     app = QtWidgets.QApplication(sys.argv)
     app.setApplicationName(APP_TITLE)
-    w = MainWindow(); w.show()
+
+    app_icon = make_app_icon()
+    app.setWindowIcon(app_icon)
+
+    w = MainWindow(app_icon)
+    w.show()
     sys.exit(app.exec())
 
 if __name__ == "__main__":
-
     main()
