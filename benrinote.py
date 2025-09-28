@@ -1,6 +1,15 @@
 # benrinote.py
 # =========================================================
 # 便利ノート（PySide6 / 単一ファイル）
+# - ToDo：タイトル/詳細を分離、完了→アーカイブ、アーカイブ編集/削除（タブ）
+# - 常駐事項：カテゴリ＝タブ、項目追加/改名/削除、D&Dで並べ替え
+# - 左：ToDo/アーカイブ + 常駐（上下スプリッタで可変）
+# - 右：詳細（選択中ToDo/常駐の本文を編集） & フリースペース
+# - 画像：貼付・D&D・挿入はすべて base64 埋め込み（外部参照は保存時にも自動で埋め込み直し）
+# - 背景色変更（各エディタ）
+# - リスト行の区切り線（ToDo/常駐）
+# - 「常に手前」トグル（起動時は必ずOFF）、トレイ常駐、×は常に押せる
+# - ツールバーをダブルクリックで 70% サイズ↔前回サイズ
 # =========================================================
 
 from __future__ import annotations
@@ -25,11 +34,14 @@ ACCENT, ACCENT_HOVER, ACCENT_WEAK = "#4F8AF3", "#6BA0F6", "#E6E6FF"
 FG, BG, PANEL_BG = "#222222", "#FAFAFB", "#FFFFFF"
 BORDER, HANDLE = "#E6E6EA", "#EAEAEA"
 
-DEFAULT_STATE = {
-    "todo": {"items": [], "archive": []},   # items: {id,title,done,html}
-    "categories": {},                        # "カテゴリ名": {"items":[{id,title,html},...]}
+DEFAULT_STATE: Dict[str, Any] = {
+    # ToDo: items: {id, title, done, html}
+    "todo": {"items": [], "archive": []},  # archive: {id, title, html, archived_at}
+    # 常駐： "カテゴリ名": {"items":[{"id","title","html"}]}
+    "categories": {},
     "category_order": [],
-    "memo2": {"html": ""},                   # フリースペース
+    # フリースペース
+    "memo2": {"html": ""},
 }
 
 # ---------- JSON I/O ----------
@@ -47,13 +59,20 @@ def save_json(path: Path, data: Dict[str, Any]):
     tmp.replace(path)
 
 # ---------- utils ----------
+def plain_to_html(text: str) -> str:
+    import html
+    if text is None: text = ""
+    return f"<p>{html.escape(text).replace('\\n', '<br>')}</p>"
+
 def html_to_plain(html: str) -> str:
+    """QTextEdit.toHtml() から素のテキストを抽出。"""
     if not html: return ""
     html = re.sub(r"<style\b[^>]*>.*?</style>", "", html, flags=re.I | re.S)
     html = re.sub(r"<head\b[^>]*>.*?</head>", "", html, flags=re.I | re.S)
     html = re.sub(r"<br\s*/?>", "\n", html, flags=re.I)
     html = re.sub(r"<[^>]+>", "", html)
-    return QtGui.QTextDocumentFragment.fromHtml(html).toPlainText().strip()
+    txt = QtGui.QTextDocumentFragment.fromHtml(html).toPlainText()
+    return txt.strip()
 
 # ---------- excepthook ----------
 def install_excepthook():
@@ -76,120 +95,119 @@ def install_excepthook():
 # リスト用：区切り線 delegate
 # =========================================================
 class SeparatorDelegate(QtWidgets.QStyledItemDelegate):
-    def paint(self, painter: QtGui.QPainter, option, index):
+    """各行の下に1pxの区切り線を描く。"""
+    def paint(self, painter: QtGui.QPainter, option: QtWidgets.QStyleOptionViewItem, index: QtCore.QModelIndex):
         super().paint(painter, option, index)
         painter.save()
-        pen = QtGui.QPen(QtGui.QColor(BORDER)); pen.setWidth(1)
+        pen = QtGui.QPen(QtGui.QColor(BORDER))
+        pen.setWidth(1)
         painter.setPen(pen)
         y = option.rect.bottom() - 1
         painter.drawLine(option.rect.left() + 6, y, option.rect.right() - 6, y)
         painter.restore()
 
-    def sizeHint(self, option, index):
+    def sizeHint(self, option: QtWidgets.QStyleOptionViewItem, index: QtCore.QModelIndex):
         sz = super().sizeHint(option, index)
-        return QtCore.QSize(sz.width(), max(sz.height(), 24))
+        return QtCore.QSize(sz.width(), max(sz.height(), 24))  # ちょい高めに
 
 # =========================================================
-# 画像リサイズ用：右下ハンドル付き QTextEdit
+# 画像：常に base64 埋め込み
 # =========================================================
-class _ResizeHandle(QtWidgets.QFrame):
-    def __init__(self, parent: QtWidgets.QWidget, drag_cb):
-        super().__init__(parent)
-        self.setCursor(QtCore.Qt.SizeFDiagCursor)
-        self.setFixedSize(10, 10)
-        self.setStyleSheet("background:#ffffff;border:1px solid #4F8AF3;border-radius:1px;")
-        self._drag_cb = drag_cb
-        self._press_pos: Optional[QtCore.QPoint] = None
+def _qimage_to_data_url(img: QtGui.QImage, fmt: str = "PNG") -> str:
+    buf = QtCore.QBuffer()
+    buf.open(QtCore.QIODevice.WriteOnly)
+    img.save(buf, fmt)
+    ba = buf.data().toBase64().data().decode("ascii")
+    mime = "image/png" if fmt.upper() == "PNG" else f"image/{fmt.lower()}"
+    return f"data:{mime};base64,{ba}"
 
-    def mousePressEvent(self, e: QtGui.QMouseEvent):
-        if e.button() == QtCore.Qt.LeftButton:
-            self._press_pos = e.globalPosition().toPoint(); e.accept()
-        else:
-            super().mousePressEvent(e)
+def inline_external_images(html: str) -> str:
+    """HTML内の <img src=...> で data: 以外をQImage読込→dataURLに差し替える。"""
+    if not html:
+        return html
 
-    def mouseMoveEvent(self, e: QtGui.QMouseEvent):
-        if self._press_pos is not None:
-            delta = e.globalPosition().toPoint() - self._press_pos
-            self._drag_cb(delta.x(), delta.y())
-            self._press_pos = e.globalPosition().toPoint()
-            e.accept()
-        else:
-            super().mouseMoveEvent(e)
+    def replace_tag(m: re.Match) -> str:
+        whole = m.group(0)
+        before = m.group(1)
+        src = m.group(2)
+        after = m.group(3)
+        # すでに data:
+        if src.lower().startswith("data:"):
+            return whole
 
-    def mouseReleaseEvent(self, e: QtGui.QMouseEvent):
-        self._press_pos = None
-        super().mouseReleaseEvent(e)
+        # file:/// または C:\... → ローカルファイル扱い
+        path = None
+        if src.lower().startswith("file:///"):
+            path = QtCore.QUrl(src).toLocalFile()
+        elif re.match(r"^[a-zA-Z]:[\\/]", src):
+            path = src
 
-class HandleTextEdit(QtWidgets.QTextEdit):
-    """画像上にカーソルを置くと右下に□が出て、ドラッグで幅を変更できる。"""
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setAcceptRichText(True)
-        self._handle = _ResizeHandle(self.viewport(), self._on_drag_delta)
-        self._handle.hide()
-        self._img_cursor: Optional[QtGui.QTextCursor] = None
+        if path and os.path.exists(path):
+            qimg = QtGui.QImage(path)
+            if not qimg.isNull():
+                dataurl = _qimage_to_data_url(qimg, "PNG")
+                return f"<img{before}src=\"{dataurl}\"{after}>"
+        return whole
 
-        self.cursorPositionChanged.connect(self._refresh_handle)
-        self.textChanged.connect(self._refresh_handle)
-        self.viewport().installEventFilter(self)
+    return re.sub(r'<img([^>]*?)\bsrc=["\']([^"\']+)["\']([^>]*)>',
+                  replace_tag, html, flags=re.I)
 
-    def _get_image_cursor(self) -> Tuple[Optional[QtGui.QTextCursor], Optional[QtGui.QTextImageFormat]]:
-        cur = self.textCursor()
+class EmbedImageTextEdit(QtWidgets.QTextEdit):
+    """貼り付け/ドロップ/HTML貼付の画像を必ず埋め込み(QImage→dataURL)にする。"""
+    def canInsertFromMimeData(self, source: QtCore.QMimeData) -> bool:
+        return source.hasImage() or source.hasUrls() or source.hasHtml() or source.hasText() or \
+               super().canInsertFromMimeData(source)
 
-        def fmt_of(c: QtGui.QTextCursor):
-            f = c.charFormat()
-            return (c, f.toImageFormat()) if f.isImageFormat() else (None, None)
+    def insertFromMimeData(self, source: QtCore.QMimeData):
+        # 1) 直接の画像
+        if source.hasImage():
+            qimg = QtGui.QImage(source.imageData())
+            if not qimg.isNull():
+                self.textCursor().insertImage(qimg)
+                return
 
-        c, f = fmt_of(cur)
-        if f: return c, f
-        cur2 = QtGui.QTextCursor(cur)
-        if cur2.position() > 0:
-            cur2.movePosition(QtGui.QTextCursor.Left, QtGui.QTextCursor.MoveAnchor, 1)
-            c, f = fmt_of(cur2)
-            if f: return c, f
-        return None, None
+        # 2) URL/ファイル
+        if source.hasUrls():
+            handled = False
+            for url in source.urls():
+                if url.isLocalFile():
+                    path = url.toLocalFile()
+                    if path.lower().endswith((".png",".jpg",".jpeg",".bmp",".gif",".webp")):
+                        qimg = QtGui.QImage(path)
+                        if not qimg.isNull():
+                            self.textCursor().insertImage(qimg)
+                            handled = True
+                        continue
+            if handled:
+                return
 
-    def _calc_image_rect(self, c: QtGui.QTextCursor, f: QtGui.QTextImageFormat) -> QtCore.QRect:
-        caret = self.cursorRect(c)
-        w = int(f.width()) if f.width() > 0 else 400
-        h = int(f.height()) if f.height() > 0 else w
-        top_left = QtCore.QPoint(caret.left(), caret.bottom() - h)
-        return QtCore.QRect(top_left, QtCore.QSize(w, h))
+        # 3) HTML片（<img src="file:///..."> や C:\... → 埋め込み）
+        if source.hasHtml():
+            html = source.html()
+            def repl(m: re.Match) -> str:
+                src = m.group(1)
+                path = None
+                if src.lower().startswith("file:///"):
+                    path = QtCore.QUrl(src).toLocalFile()
+                elif re.match(r"^[a-zA-Z]:[\\/]", src):
+                    path = src
+                if path and os.path.exists(path):
+                    qimg = QtGui.QImage(path)
+                    if not qimg.isNull():
+                        self.textCursor().insertImage(qimg)  # ここで埋め込み
+                        return ""  # 元タグは消す
+                return m.group(0)
+            html_wo_imgs = re.sub(r'<img[^>]*\bsrc=["\']([^"\']+)["\'][^>]*>', repl, html, flags=re.I)
+            self.insertHtml(html_wo_imgs)
+            return
 
-    def _refresh_handle(self):
-        cur, imgf = self._get_image_cursor()
-        if not imgf or not cur:
-            self._img_cursor = None; self._handle.hide(); return
-        self._img_cursor = QtGui.QTextCursor(cur)
-        rect = self._calc_image_rect(cur, imgf)
-        self._handle.move(rect.right() - self._handle.width() + 1,
-                          rect.bottom() - self._handle.height() + 1)
-        self._handle.show()
-        self.viewport().update()
-
-    def eventFilter(self, obj, ev):
-        if obj is self.viewport():
-            if ev.type() in (QtCore.QEvent.Resize, QtCore.QEvent.Wheel, QtCore.QEvent.Paint,
-                             QtCore.QEvent.Scroll, QtCore.QEvent.MouseMove, QtCore.QEvent.MouseButtonRelease):
-                QtCore.QTimer.singleShot(0, self._refresh_handle)
-        return super().eventFilter(obj, ev)
-
-    def _on_drag_delta(self, dx: int, dy: int):
-        if not self._img_cursor: return
-        cur = QtGui.QTextCursor(self._img_cursor)
-        fmt = cur.charFormat()
-        if not fmt.isImageFormat(): return
-        imgf = fmt.toImageFormat()
-        cur_w = imgf.width() if imgf.width() > 0 else 400.0
-        new_w = max(48.0, cur_w + dx)
-        imgf.setWidth(float(new_w))
-        cur.mergeCharFormat(imgf)
-        self._refresh_handle()
+        # 4) それ以外は通常処理
+        super().insertFromMimeData(source)
 
 # =========================================================
 # リッチツールバー
 # =========================================================
-def _icon_under(size=18) -> QtGui.QIcon:
+def make_icon_A_underline(size=18) -> QtGui.QIcon:
     pm = QtGui.QPixmap(size, size); pm.fill(QtCore.Qt.GlobalColor.transparent)
     p = QtGui.QPainter(pm); p.setRenderHint(QtGui.QPainter.Antialiasing, True)
     font = QtGui.QFont("Segoe UI"); font.setBold(True); font.setPointSizeF(size * 0.65)
@@ -197,23 +215,24 @@ def _icon_under(size=18) -> QtGui.QIcon:
     rect = QtCore.QRectF(0, -2, size, size)
     p.drawText(rect, QtCore.Qt.AlignHCenter | QtCore.Qt.AlignVCenter, "A")
     p.setPen(QtGui.QPen(QtGui.QColor(FG), 2, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap))
-    y = int(size * 0.82); p.drawLine(int(size*0.18), y, int(size*0.82), y); p.end()
-    return QtGui.QIcon(pm)
+    y = int(size * 0.82); p.drawLine(int(size*0.18), y, int(size*0.82), y)
+    p.end(); return QtGui.QIcon(pm)
 
-def _icon_palette(color: QtGui.QColor, size=18) -> QtGui.QIcon:
+def make_icon_palette(color: QtGui.QColor, size=18) -> QtGui.QIcon:
     pm = QtGui.QPixmap(size, size); pm.fill(QtCore.Qt.GlobalColor.transparent)
     p = QtGui.QPainter(pm); p.setRenderHint(QtGui.QPainter.Antialiasing, True)
-    path = QtGui.QPainterPath(); r = size - 2
+    path = QtGui.QPainterPath()
+    r = size - 2
     path.addRoundedRect(QtCore.QRectF(1, 2, r, r-2), size*0.3, size*0.3)
     hole = QtGui.QPainterPath(); hole.addEllipse(QtCore.QRectF(size*0.45, size*0.55, size*0.28, size*0.28))
     shape = path.subtracted(hole)
     p.fillPath(shape, QtGui.QBrush(QtGui.QColor(245,245,245)))
     p.setPen(QtGui.QPen(QtGui.QColor(FG), 1)); p.drawPath(shape)
     p.setBrush(QtGui.QBrush(color)); p.setPen(QtGui.QPen(QtGui.QColor(FG), 1))
-    p.drawEllipse(QtCore.QRectF(size*0.18, size*0.22, size*0.28, size*0.28)); p.end()
-    return QtGui.QIcon(pm)
+    p.drawEllipse(QtCore.QRectF(size*0.18, size*0.22, size*0.28, size*0.28))
+    p.end(); return QtGui.QIcon(pm)
 
-def _icon_picture(size=18) -> QtGui.QIcon:
+def make_icon_picture(size=18) -> QtGui.QIcon:
     pm = QtGui.QPixmap(size, size); pm.fill(QtCore.Qt.GlobalColor.transparent)
     p = QtGui.QPainter(pm); p.setRenderHint(QtGui.QPainter.Antialiasing, True)
     p.setPen(QtGui.QPen(QtGui.QColor(FG), 1)); p.setBrush(QtGui.QBrush(QtGui.QColor("#eaeefc")))
@@ -222,15 +241,8 @@ def _icon_picture(size=18) -> QtGui.QIcon:
     points = [QtCore.QPointF(size*0.2,size*0.7), QtCore.QPointF(size*0.45,size*0.45), QtCore.QPointF(size*0.75,size*0.75)]
     p.drawPolygon(QtGui.QPolygonF(points))
     p.setBrush(QtGui.QBrush(QtGui.QColor("#ffd866"))); p.setPen(QtGui.QPen(QtGui.QColor(FG), 0))
-    p.drawEllipse(QtCore.QRectF(size*0.58,size*0.22,size*0.16,size*0.16)); p.end()
-    return QtGui.QIcon(pm)
-
-def _icon_resize(size=18) -> QtGui.QIcon:
-    pm = QtGui.QPixmap(size, size); pm.fill(QtCore.Qt.GlobalColor.transparent)
-    p = QtGui.QPainter(pm); p.setRenderHint(QtGui.QPainter.Antialiasing, True)
-    p.setPen(QtGui.QPen(QtGui.QColor(FG), 2)); p.drawRect(3,3,size-6,size-6)
-    p.drawLine(size-8,size-3,size-3,size-8); p.end()
-    return QtGui.QIcon(pm)
+    p.drawEllipse(QtCore.QRectF(size*0.58,size*0.22,size*0.16,size*0.16))
+    p.end(); return QtGui.QIcon(pm)
 
 class RichBar(QtWidgets.QToolBar):
     htmlChanged = QtCore.Signal()
@@ -240,36 +252,33 @@ class RichBar(QtWidgets.QToolBar):
         self.setIconSize(QtCore.QSize(18, 18))
         self.setStyleSheet("QToolBar{border:0; background: transparent;}")
 
-        self.actUnderline = QtGui.QAction(_icon_under(), "下線", self)
-        self.actUnderline.setCheckable(True); self.actUnderline.toggled.connect(self._underline)
+        self.actUnderline = QtGui.QAction(make_icon_A_underline(), "下線", self)
+        self.actUnderline.setCheckable(True); self.actUnderline.toggled.connect(self.toggle_underline)
         self.addAction(self.actUnderline)
 
         self._color = QtGui.QColor(FG)
-        self.actColor = QtGui.QAction(_icon_palette(self._color), "文字色", self)
-        self.actColor.triggered.connect(self._pick_text_color); self.addAction(self.actColor)
+        self.actColor = QtGui.QAction(make_icon_palette(self._color), "文字色", self)
+        self.actColor.triggered.connect(self.pick_text_color); self.addAction(self.actColor)
 
         self.addSeparator()
 
         self._bg = QtGui.QColor(PANEL_BG)
-        self.actBG = QtGui.QAction(_icon_palette(self._bg), "背景色（エディタ）", self)
-        self.actBG.triggered.connect(self._pick_bg_color); self.addAction(self.actBG)
+        self.actBG = QtGui.QAction(make_icon_palette(self._bg), "背景色（エディタ）", self)
+        self.actBG.triggered.connect(self.pick_bg_color); self.addAction(self.actBG)
 
-        self.actPasteImg = QtGui.QAction(_icon_picture(), "画像貼り付け（クリップボード）", self)
-        self.actPasteImg.triggered.connect(self._paste_image_from_clipboard); self.addAction(self.actPasteImg)
+        self.actPasteImg = QtGui.QAction(make_icon_picture(), "画像貼り付け（クリップボード）", self)
+        self.actPasteImg.triggered.connect(self.paste_image_from_clipboard); self.addAction(self.actPasteImg)
 
-        self.actInsertImg = QtGui.QAction(_icon_picture(), "画像挿入（ファイル）", self)
-        self.actInsertImg.triggered.connect(self._insert_image_from_file); self.addAction(self.actInsertImg)
+        self.actInsertImg = QtGui.QAction(make_icon_picture(), "画像挿入（ファイル）", self)
+        self.actInsertImg.triggered.connect(self.insert_image_from_file); self.addAction(self.actInsertImg)
 
-        self.actResizeImg = QtGui.QAction(_icon_resize(), "画像サイズ変更（数値指定）", self)
-        self.actResizeImg.triggered.connect(self._resize_selected_image); self.addAction(self.actResizeImg)
-
-    def _underline(self, on: bool):
+    def toggle_underline(self, on: bool):
         fmt = QtGui.QTextCharFormat(); fmt.setFontUnderline(on); self._merge(fmt)
 
-    def _pick_text_color(self):
+    def pick_text_color(self):
         col = QtWidgets.QColorDialog.getColor(self._color, self, "文字色を選択")
         if col.isValid():
-            self._color = col; self.actColor.setIcon(_icon_palette(self._color))
+            self._color = col; self.actColor.setIcon(make_icon_palette(self._color))
             fmt = QtGui.QTextCharFormat(); fmt.setForeground(QtGui.QBrush(col)); self._merge(fmt)
 
     def _merge(self, fmt: QtGui.QTextCharFormat):
@@ -278,24 +287,26 @@ class RichBar(QtWidgets.QToolBar):
         else: self.target.mergeCurrentCharFormat(fmt)
         self.htmlChanged.emit()
 
-    def _pick_bg_color(self):
+    def pick_bg_color(self):
         col = QtWidgets.QColorDialog.getColor(self._bg, self, "背景色（エディタ）を選択")
         if not col.isValid(): return
-        self._bg = col; self.actBG.setIcon(_icon_palette(self._bg))
+        self._bg = col; self.actBG.setIcon(make_icon_palette(self._bg))
         self.target.setStyleSheet(
             f"QTextEdit{{background:{col.name()}; padding:6px; border:1px solid {BORDER}; border-radius:8px;}}"
         )
 
-    def _paste_image_from_clipboard(self):
+    def paste_image_from_clipboard(self):
         cb = QtWidgets.QApplication.clipboard()
         if img := cb.image():
-            self.target.textCursor().insertImage(QtGui.QImage(img))
-            self.htmlChanged.emit()
+            qimg = QtGui.QImage(img)
+            if not qimg.isNull():
+                self.target.textCursor().insertImage(qimg)
+                self.htmlChanged.emit()
         else:
             QtWidgets.QMessageBox.information(self, "情報", "クリップボードに画像がありません。")
 
-    def _insert_image_from_file(self):
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "画像を選択", "", "画像ファイル (*.png *.jpg *.jpeg *.bmp *.gif)")
+    def insert_image_from_file(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "画像を選択", "", "画像ファイル (*.png *.jpg *.jpeg *.bmp *.gif *.webp)")
         if not path: return
         qimg = QtGui.QImage(path)
         if qimg.isNull():
@@ -303,17 +314,32 @@ class RichBar(QtWidgets.QToolBar):
         self.target.textCursor().insertImage(qimg)
         self.htmlChanged.emit()
 
-    def _resize_selected_image(self):
+    def resize_selected_image(self):
+        """カーソル位置の画像（または直前の画像）の幅をpx指定で変更"""
         cur = self.target.textCursor()
         fmt = cur.charFormat()
+
+        # 画像直後にカーソルがあるケース：直前の1文字をチェック
         if not fmt.isImageFormat():
-            QtWidgets.QMessageBox.information(self, "情報", "サイズ変更したい画像を選択（画像上にカーソル）してください。")
+            cur2 = QtGui.QTextCursor(cur)
+            if cur2.position() > 0:
+                cur2.movePosition(QtGui.QTextCursor.Left, QtGui.QTextCursor.MoveAnchor, 1)
+                fmt2 = cur2.charFormat()
+                if fmt2.isImageFormat():
+                    cur = cur2
+                    fmt = fmt2
+
+        if not fmt.isImageFormat():
+            QtWidgets.QMessageBox.information(self, "情報", "サイズ変更したい画像の上（または直後）にカーソルを置いてください。")
             return
-        imgf = fmt.toImageFormat()
-        current_w = int(imgf.width()) if imgf.width() > 0 else 400
+
+        imgf: QtGui.QTextImageFormat = fmt.toImageFormat()
+        current_w = int(imgf.width()) if imgf.width() > 0 else 400  # 幅未設定なら暫定400px
         new_w, ok = QtWidgets.QInputDialog.getInt(self, "画像の幅", "幅 (px)：", current_w, 48, 4000, 1)
-        if not ok: return
-        imgf.setWidth(float(new_w))
+        if not ok:
+            return
+
+        imgf.setWidth(float(new_w))  # 高さはアスペクト比に従って自動
         cur.mergeCharFormat(imgf)
         self.htmlChanged.emit()
 
@@ -330,9 +356,14 @@ class TodoModel(QtCore.QAbstractListModel):
         if role == QtCore.Qt.FontRole and it.get("done"):
             f = QtGui.QFont(); f.setStrikeOut(True); return f
         return None
-    def add(self, title: str):
+    def add(self, text: str, html: str = None):
         self.beginInsertRows(QtCore.QModelIndex(), len(self.items), len(self.items))
-        self.items.append({"id": str(uuid.uuid4()), "title": title, "done": False, "html": ""})
+        self.items.append({
+            "id": str(uuid.uuid4()),
+            "title": text,
+            "done": False,
+            "html": html or ""
+        })
         self.endInsertRows()
     def toggle(self, row: int):
         if 0 <= row < len(self.items):
@@ -345,25 +376,31 @@ class TodoModel(QtCore.QAbstractListModel):
 
 # ---------- Main Window ----------
 class MainWindow(QtWidgets.QMainWindow):
-    def __init__(self, app_icon: QtGui.QIcon):
+    def __init__(self):
         super().__init__()
         self.setWindowTitle(APP_TITLE)
-        self.setWindowIcon(app_icon)
+        self.setWindowIcon(QtGui.QIcon.fromTheme("sticky-notes"))
         self.prev_geometry: Optional[QtCore.QRect] = None
 
         self.state = load_json(DATA_FILE, DEFAULT_STATE)
-        # ToDo: 古い text フィールドの移行
+
+        # ToDo: text→title への移行（古いデータ保護）
         changed = False
         for it in self.state["todo"]["items"]:
-            if "title" not in it: it["title"] = it.get("text",""); changed = True
+            if "title" not in it:
+                it["title"] = it.get("text", ""); changed = True
         for it in self.state["todo"]["archive"]:
-            if "title" not in it: it["title"] = it.get("text",""); changed = True
-        if changed: save_json(DATA_FILE, self.state)
+            if "title" not in it:
+                it["title"] = it.get("text", ""); changed = True
+        if changed:
+            save_json(DATA_FILE, self.state)
 
         self._migrate_categories_to_items()
-        self.conf = load_json(CONF_FILE, {"geometry": None})
+        self.conf  = load_json(CONF_FILE, {"geometry": None})
 
+        # ★ 詳細参照（どのアイテムを編集しているか）
         self._detail_ref: Optional[Tuple] = None
+
         self._apply_global_style()
 
         # ===== Top toolbar =====
@@ -372,11 +409,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.topBar.setIconSize(QtCore.QSize(18,18))
         self.topBar.setStyleSheet(f"""
             QToolBar{{padding:6px; border:0; background: {BG};}}
-            QToolButton{{padding:6px 12px; border:1px solid {BORDER}; border-radius:8px; background:{PANEL_BG};}}
+            QToolButton{{
+                padding:6px 12px; border:1px solid {BORDER}; border-radius:8px; background:{PANEL_BG};
+            }}
             QToolButton:checked{{background:{ACCENT_WEAK}; border-color:{ACCENT}; color:{FG};}}
             QToolButton:hover{{border-color:{ACCENT_HOVER};}}
         """)
         self.addToolBar(QtCore.Qt.TopToolBarArea, self.topBar)
+
         self.actOnTop = QtGui.QAction("常に手前に表示", self, checkable=True, checked=False)
         self.actOnTop.toggled.connect(self._toggle_always_on_top)
         btnOnTop = QtWidgets.QToolButton(); btnOnTop.setDefaultAction(self.actOnTop); btnOnTop.setCheckable(True)
@@ -384,10 +424,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.topBar.installEventFilter(self)
 
         # ===== 右：詳細 & フリースペース =====
-        self.detailEditor = HandleTextEdit()
+        self.detailEditor = EmbedImageTextEdit()
         self.detailEditor.setStyleSheet(f"QTextEdit{{background:{PANEL_BG}; padding:6px; border:1px solid {BORDER}; border-radius:8px;}}")
         self.detailBar = RichBar(self.detailEditor)
         self.detailLabel = QtWidgets.QLabel("詳細"); self.detailLabel.setStyleSheet("font-weight:bold; color:%s;" % FG)
+        # 画像サイズ変更（詳細）
+        btnResizeImgDetail = QtWidgets.QPushButton("画像サイズ変更")
+        btnResizeImgDetail.clicked.connect(self.detailBar.resize_selected_image)
 
         self._detailTimer = QtCore.QTimer(self); self._detailTimer.setSingleShot(True); self._detailTimer.setInterval(400)
         self.detailEditor.textChanged.connect(lambda: self._detailTimer.start())
@@ -395,18 +438,27 @@ class MainWindow(QtWidgets.QMainWindow):
 
         detailPane = QtWidgets.QWidget(); v1 = QtWidgets.QVBoxLayout(detailPane)
         v1.setContentsMargins(10,10,5,10); v1.setSpacing(6)
-        v1.addWidget(self.detailLabel); v1.addWidget(self.detailBar); v1.addWidget(self.detailEditor, 1)
+        v1.addWidget(self.detailLabel)
+        v1.addWidget(self.detailBar)
+        v1.addWidget(btnResizeImgDetail, alignment=QtCore.Qt.AlignLeft)
+        v1.addWidget(self.detailEditor, 1)
 
-        self.memoFree = HandleTextEdit()
+        self.memoFree = EmbedImageTextEdit()
         self.memoFree.setHtml(self.state["memo2"]["html"])
         self.memoFree.textChanged.connect(self._on_free_html_changed)
         self.memoFree.setStyleSheet(f"QTextEdit{{background:{PANEL_BG}; padding:6px; border:1px solid {BORDER}; border-radius:8px;}}")
         self.memoFreeBar = RichBar(self.memoFree)
         labFree = QtWidgets.QLabel("フリースペース"); labFree.setStyleSheet("font-weight:bold; color:%s;" % FG)
+        # 画像サイズ変更（フリースペース）
+        btnResizeImgFree = QtWidgets.QPushButton("画像サイズ変更")
+        btnResizeImgFree.clicked.connect(self.memoFreeBar.resize_selected_image)
 
         freePane = QtWidgets.QWidget(); v2 = QtWidgets.QVBoxLayout(freePane)
         v2.setContentsMargins(5,10,10,10); v2.setSpacing(6)
-        v2.addWidget(labFree); v2.addWidget(self.memoFreeBar); v2.addWidget(self.memoFree, 1)
+        v2.addWidget(labFree)
+        v2.addWidget(self.memoFreeBar)
+        v2.addWidget(btnResizeImgFree, alignment=QtCore.Qt.AlignLeft)
+        v2.addWidget(self.memoFree, 1)
 
         rightSplitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
         rightSplitter.addWidget(detailPane); rightSplitter.addWidget(freePane)
@@ -432,8 +484,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.todoList.setItemDelegate(SeparatorDelegate(self.todoList))
         self.todoList.selectionModel().currentChanged.connect(self._on_todo_selected)
         self.todoList.clicked.connect(lambda idx: self._load_detail(("todo", idx.row())))
+
         self.todoInput = QtWidgets.QLineEdit(); self.todoInput.setPlaceholderText("ToDo を入力して Enter")
         self.todoInput.returnPressed.connect(self._add_todo)
+
         btnTgl = QtWidgets.QPushButton("完了/未完了")
         btnDel = QtWidgets.QPushButton("選択削除")
         btnArc = QtWidgets.QPushButton("完了→アーカイブ")
@@ -442,6 +496,7 @@ class MainWindow(QtWidgets.QMainWindow):
         btnDel.clicked.connect(self._del_selected_todo)
         btnArc.clicked.connect(self._archive_done)
         btnRen.clicked.connect(self._rename_selected_todo)
+
         todoPane = QtWidgets.QWidget(); vct = QtWidgets.QVBoxLayout(todoPane)
         vct.setContentsMargins(8,8,8,8)
         vct.addWidget(self.todoList); vct.addWidget(self.todoInput)
@@ -463,23 +518,26 @@ class MainWindow(QtWidgets.QMainWindow):
         self.centerTabs.addTab(todoPane, "ToDo")
         self.centerTabs.addTab(arcPane, "アーカイブ")
 
-        # ===== 左：常駐カテゴリ（タブ）=====
+        # ===== 左：常駐カテゴリ =====
         self.residentTabs = QtWidgets.QTabWidget()
         self.residentTabs.setTabsClosable(False)
         self.residentTabs.tabBar().setMovable(True)
         self.residentTabs.tabBar().installEventFilter(self)
+
         btnAddCat = QtWidgets.QToolButton(); btnAddCat.setText("＋"); btnAddCat.clicked.connect(self._add_resident_tab)
         btnRenCat = QtWidgets.QToolButton(); btnRenCat.setText("改"); btnRenCat.clicked.connect(self._rename_resident_tab)
         btnDelCat = QtWidgets.QToolButton(); btnDelCat.setText("削"); btnDelCat.clicked.connect(self._delete_resident_tab)
+
         leftBottom = QtWidgets.QWidget()
         vlb = QtWidgets.QVBoxLayout(leftBottom); vlb.setContentsMargins(8,0,8,8)
         titleCat = QtWidgets.QLabel("常駐事項"); titleCat.setStyleSheet("font-weight: bold; color: %s;" % FG)
         toolRow = QtWidgets.QHBoxLayout(); toolRow.addWidget(titleCat); toolRow.addStretch(1)
         toolRow.addWidget(btnAddCat); toolRow.addWidget(btnRenCat); toolRow.addWidget(btnDelCat)
         vlb.addLayout(toolRow); vlb.addWidget(self.residentTabs)
+
         self._rebuild_resident_tabs()
 
-        # ===== 左：上下スプリッタ =====
+        # ===== 左の上下スプリッタ =====
         leftSplit = QtWidgets.QSplitter(QtCore.Qt.Vertical)
         leftSplit.addWidget(self.centerTabs)
         leftSplit.addWidget(leftBottom)
@@ -501,9 +559,10 @@ class MainWindow(QtWidgets.QMainWindow):
         """)
         self.setCentralWidget(splitter)
 
-        # 起動時は OnTop OFF 固定
+        # 起動時は必ず OnTop OFF
         self._force_standard_window_buttons()
         self._apply_on_top(False, first_time=True)
+
         self._restore_geometry()
         self._setup_tray()
 
@@ -511,18 +570,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.saveTimer = QtCore.QTimer(self); self.saveTimer.setInterval(2000)
         self.saveTimer.timeout.connect(self._save_all); self.saveTimer.start()
 
-        # 初期選択（1件でも確実に詳細が出る）
+        # 詳細初期状態 + 初期選択
         self._load_detail(None)
         if self.todoModel.rowCount() > 0:
             self.todoList.setCurrentIndex(self.todoModel.index(0))
             self._load_detail(("todo", 0))
 
-    # ====== 旧データ形式 → 新形式への移行 ======
+    # ====== 常駐カテゴリ：データ移行 ======
     def _migrate_categories_to_items(self):
-        self.state.setdefault("categories", {})
-        self.state.setdefault("category_order", [])
         changed = False
-        cats = self.state["categories"]
+        cats = self.state.get("categories", {})
         for name, val in list(cats.items()):
             if isinstance(val, dict) and "items" not in val:
                 html = val.get("html", "")
@@ -533,10 +590,11 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 items = cats[name].get("items", [])
                 for it in items:
-                    if "id" not in it: it["id"] = str(uuid.uuid4()); changed = True
-                    if "title" not in it: it["title"] = "無題"; changed = True
-                    if "html" not in it: it["html"] = ""; changed = True
-        if changed: save_json(DATA_FILE, self.state)
+                    it.setdefault("id", str(uuid.uuid4()))
+                    it.setdefault("title", "無題")
+                    it.setdefault("html", "")
+        if changed:
+            save_json(DATA_FILE, self.state)
 
     # ====== 常駐カテゴリ UI ======
     def _rebuild_resident_tabs(self):
@@ -581,19 +639,21 @@ class MainWindow(QtWidgets.QMainWindow):
 
         v.addWidget(lst, 1); v.addLayout(hb)
 
+        # 初期選択（1件でも確実に詳細が出る）
         if lst.count() > 0:
             lst.setCurrentRow(0)
             self._on_resident_selected(cat_name, 0)
 
         return wrap
 
-    # --- 常駐：項目操作 ---
+    # --- 項目操作 ---
     def _add_resident_item(self, cat_name: str, list_widget: QtWidgets.QListWidget):
         title, ok = QtWidgets.QInputDialog.getText(self, "項目の追加", "項目名：")
         if not ok or not title.strip(): return
-        item = {"id": str(uuid.uuid4()), "title": title.strip(), "html": ""}
+        title = title.strip()
+        item = {"id": str(uuid.uuid4()), "title": title, "html": ""}
         self.state["categories"][cat_name]["items"].append(item)
-        list_widget.addItem(item["title"])
+        list_widget.addItem(title)
         row = list_widget.count() - 1
         list_widget.setCurrentRow(row)
         self._on_resident_selected(cat_name, row)
@@ -628,10 +688,10 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_resident_item_rows_moved(self, cat_name: str, list_widget: QtWidgets.QListWidget):
         items = self.state["categories"][cat_name]["items"]
         new_titles = [list_widget.item(i).text() for i in range(list_widget.count())]
-        title_to_list: Dict[str, List[Dict[str,Any]]] = {}
+        title_to_list: Dict[str, List[Dict[str, Any]]] = {}
         for it in items:
             title_to_list.setdefault(it["title"], []).append(it)
-        new_items = []
+        new_items: List[Dict[str, Any]] = []
         for t in new_titles:
             new_items.append(title_to_list[t].pop(0))
         self.state["categories"][cat_name]["items"] = new_items
@@ -659,7 +719,8 @@ class MainWindow(QtWidgets.QMainWindow):
             row = ref[1]
             if 0 <= row < len(self.state["todo"]["items"]):
                 it = self.state["todo"]["items"][row]
-                self.detailLabel.setText(f"詳細（ToDo / {it.get('title','')}）")
+                title = it.get("title", "")
+                self.detailLabel.setText(f"詳細（ToDo / {title}）")
                 self.detailEditor.blockSignals(True)
                 self.detailEditor.setHtml(it.get("html", ""))
                 self.detailEditor.blockSignals(False)
@@ -674,8 +735,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.detailEditor.blockSignals(False)
 
     def _apply_detail_to_state(self):
-        if not self._detail_ref: return
-        html = self.detailEditor.toHtml()
+        if not self._detail_ref:
+            return
+        # ★ 保存直前に外部参照を dataURL に置換
+        html = inline_external_images(self.detailEditor.toHtml())
         if self._detail_ref[0] == "todo":
             row = self._detail_ref[1]
             if 0 <= row < len(self.state["todo"]["items"]):
@@ -690,7 +753,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # --- カテゴリ（タブ）操作 ---
     def _on_resident_tab_moved(self, from_idx: int, to_idx: int):
-        self.state["category_order"] = [self.residentTabs.tabText(i) for i in range(self.residentTabs.count())]
+        new_order = [self.residentTabs.tabText(i) for i in range(self.residentTabs.count())]
+        self.state["category_order"] = new_order
         self._save_all()
 
     def _add_resident_tab(self):
@@ -736,95 +800,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._rebuild_resident_tabs()
         if self._detail_ref and self._detail_ref[0] == "resident" and self._detail_ref[1] == name:
             self._load_detail(None)
-        self._save_all()
-
-    # ----- ToDo 操作 -----
-    def _add_todo(self):
-        title = self.todoInput.text().strip()
-        if not title: return
-        self.todoModel.add(title); self.todoInput.clear(); self._save_all()
-        # 追加直後に選択
-        row = self.todoModel.rowCount(None) - 1
-        self.todoList.setCurrentIndex(self.todoModel.index(row))
-        self._load_detail(("todo", row))
-
-    def _selected_row(self):
-        idx = self.todoList.currentIndex()
-        return idx.row() if idx.isValid() else -1
-
-    def _toggle_selected_todo(self):
-        row = self._selected_row()
-        if row >= 0:
-            self.todoModel.toggle(row); self._save_all()
-
-    def _del_selected_todo(self):
-        row = self._selected_row()
-        if row >= 0:
-            self.todoModel.remove(row)
-            self._save_all()
-            if self.todoModel.rowCount(None) == 0:
-                self._load_detail(None)
-
-    def _rename_selected_todo(self):
-        row = self._selected_row()
-        if row < 0: return
-        cur_title = self.state["todo"]["items"][row]["title"]
-        new, ok = QtWidgets.QInputDialog.getText(self, "タイトル変更", "新しいタイトル：", text=cur_title)
-        if not ok: return
-        new = new.strip()
-        if not new: return
-        self.state["todo"]["items"][row]["title"] = new
-        self.todoModel.dataChanged.emit(self.todoModel.index(row), self.todoModel.index(row))
-        if self._detail_ref and self._detail_ref[0] == "todo" and self._detail_ref[1] == row:
-            self.detailLabel.setText(f"詳細（ToDo / {new}）")
-        self._save_all()
-
-    def _archive_done(self):
-        done = [it for it in self.state["todo"]["items"] if it.get("done")]
-        if not done:
-            QtWidgets.QMessageBox.information(self, "情報", "完了済みのToDoがありません。"); return
-        now = int(time.time())
-        for it in done:
-            self.state["todo"]["archive"].append({
-                "id": it["id"], "title": it["title"], "archived_at": now,
-                "html": it.get("html", "")
-            })
-        self.state["todo"]["items"] = [it for it in self.state["todo"]["items"] if not it.get("done")]
-        self.todoModel.layoutChanged.emit()
-        self._refresh_archive_list()
-        self._save_all()
-        self.centerTabs.setCurrentIndex(1)
-
-    # ----- Archive -----
-    def _refresh_archive_list(self):
-        self.archiveList.clear()
-        for it in sorted(self.state["todo"]["archive"], key=lambda x: x.get("archived_at", 0), reverse=True):
-            ts = QtCore.QDateTime.fromSecsSinceEpoch(it.get("archived_at", 0)).toString("yyyy-MM-dd HH:mm")
-            self.archiveList.addItem(f"{ts}  -  {it['title']}")
-
-    def _delete_selected_archive(self):
-        row = self.archiveList.currentRow()
-        if row < 0: return
-        if QtWidgets.QMessageBox.question(self, "削除確認", "選択したアーカイブ項目を削除しますか？") != QtWidgets.QMessageBox.Yes:
-            return
-        sorted_arc = sorted(self.state["todo"]["archive"], key=lambda x: x.get("archived_at", 0), reverse=True)
-        target = sorted_arc[row]
-        self.state["todo"]["archive"] = [it for it in self.state["todo"]["archive"] if it["id"] != target["id"]]
-        self._refresh_archive_list(); self._save_all()
-
-    def _edit_archive_item(self, item: QtWidgets.QListWidgetItem):
-        row = self.archiveList.row(item)
-        sorted_arc = sorted(self.state["todo"]["archive"], key=lambda x: x.get("archived_at", 0), reverse=True)
-        target = sorted_arc[row]
-        # アーカイブの詳細は右の「詳細」ではなく、この場で編集（簡易）
-        text, ok = QtWidgets.QInputDialog.getMultiLineText(self, "アーカイブ編集", "本文（テキスト）", html_to_plain(target.get("html","")))
-        if ok:
-            target["html"] = QtGui.QTextDocumentFragment.fromPlainText(text).toHtml()
-            self._save_all()
-
-    # ----- 右側：フリースペース保存 -----
-    def _on_free_html_changed(self):
-        self.state["memo2"]["html"] = self.memoFree.toHtml()
         self._save_all()
 
     # ----- Global style -----
@@ -883,7 +858,8 @@ class MainWindow(QtWidgets.QMainWindow):
         act_show = menu.addAction("表示／前面へ"); act_hide = menu.addAction("最小化")
         menu.addSeparator()
         self.actTrayOnTop = menu.addAction("常に手前に表示")
-        self.actTrayOnTop.setCheckable(True); self.actTrayOnTop.setChecked(False)
+        self.actTrayOnTop.setCheckable(True)
+        self.actTrayOnTop.setChecked(False)
         self.actTrayOnTop.toggled.connect(self._toggle_always_on_top)
         menu.addSeparator()
         act_quit = menu.addAction("終了")
@@ -940,7 +916,107 @@ class MainWindow(QtWidgets.QMainWindow):
         self.conf["geometry"] = [g.x(), g.y(), g.width(), g.height()]
         save_json(CONF_FILE, self.conf)
 
-    # ----- Common -----
+    # ----- ToDo -----
+    def _add_todo(self):
+        text = self.todoInput.text().strip()
+        if not text: return
+        self.todoModel.add(text); self.todoInput.clear(); self._save_all()
+        # 追加直後に選択 & 詳細へ
+        row = self.todoModel.rowCount() - 1
+        self.todoList.setCurrentIndex(self.todoModel.index(row))
+        self._load_detail(("todo", row))
+
+    def _selected_row(self):
+        idx = self.todoList.currentIndex()
+        return idx.row() if idx.isValid() else -1
+
+    def _toggle_selected_todo(self):
+        row = self._selected_row()
+        if row >= 0:
+            self.todoModel.toggle(row); self._save_all()
+
+    def _del_selected_todo(self):
+        row = self._selected_row()
+        if row >= 0:
+            self.todoModel.remove(row); self._save_all()
+            self._load_detail(None)
+
+    def _rename_selected_todo(self):
+        row = self._selected_row()
+        if row < 0: return
+        cur = self.state["todo"]["items"][row].get("title","")
+        new, ok = QtWidgets.QInputDialog.getText(self, "タイトル変更", "新しいタイトル：", text=cur)
+        if not ok: return
+        new = new.strip()
+        if not new: return
+        self.state["todo"]["items"][row]["title"] = new
+        self.todoModel.dataChanged.emit(self.todoModel.index(row), self.todoModel.index(row))
+        if self._detail_ref and self._detail_ref[0] == "todo" and self._detail_ref[1] == row:
+            self.detailLabel.setText(f"詳細（ToDo / {new}）")
+        self._save_all()
+
+    def _edit_archive_item(self, item: QtWidgets.QListWidgetItem):
+        # アーカイブはタイトル/本文の編集（ダイアログ）
+        row = self.archiveList.row(item)
+        sorted_arc = sorted(self.state["todo"]["archive"], key=lambda x: x.get("archived_at", 0), reverse=True)
+        target = sorted_arc[row]
+        # タイトル
+        new_title, ok = QtWidgets.QInputDialog.getText(self, "アーカイブのタイトル", "タイトル：", text=target.get("title",""))
+        if not ok: return
+        # 本文（簡易）
+        dlg = QtWidgets.QInputDialog(self); dlg.setWindowTitle("アーカイブの本文（プレーンテキスト）")
+        dlg.setLabelText("本文：")
+        dlg.setTextValue(html_to_plain(target.get("html","")))
+        if dlg.exec() == QtWidgets.QDialog.Accepted:
+            body_plain = dlg.textValue()
+            body_html = plain_to_html(body_plain)
+            for it in self.state["todo"]["archive"]:
+                if it["id"] == target["id"]:
+                    it["title"] = new_title
+                    it["html"] = body_html
+                    break
+            self._refresh_archive_list(); self._save_all()
+
+    def _archive_done(self):
+        done = [it for it in self.state["todo"]["items"] if it.get("done")]
+        if not done:
+            QtWidgets.QMessageBox.information(self, "情報", "完了済みのToDoがありません。"); return
+        now = int(time.time())
+        for it in done:
+            self.state["todo"]["archive"].append({
+                "id": it["id"], "title": it.get("title",""), "archived_at": now,
+                "html": it.get("html", "")
+            })
+        self.state["todo"]["items"] = [it for it in self.state["todo"]["items"] if not it.get("done")]
+        self.todoModel.layoutChanged.emit()
+        self._refresh_archive_list()
+        self._save_all()
+        self.centerTabs.setCurrentIndex(1)
+
+    # ----- Archive -----
+    def _delete_selected_archive(self):
+        row = self.archiveList.currentRow()
+        if row < 0: return
+        if QtWidgets.QMessageBox.question(self, "削除確認", "選択したアーカイブ項目を削除しますか？") != QtWidgets.QMessageBox.Yes:
+            return
+        sorted_arc = sorted(self.state["todo"]["archive"], key=lambda x: x.get("archived_at", 0), reverse=True)
+        target = sorted_arc[row]
+        self.state["todo"]["archive"] = [it for it in self.state["todo"]["archive"] if it["id"] != target["id"]]
+        self._refresh_archive_list(); self._save_all()
+
+    def _refresh_archive_list(self):
+        self.archiveList.clear()
+        for it in sorted(self.state["todo"]["archive"], key=lambda x: x.get("archived_at", 0), reverse=True):
+            ts = QtCore.QDateTime.fromSecsSinceEpoch(it.get("archived_at", 0)).toString("yyyy-MM-dd HH:mm")
+            self.archiveList.addItem(f"{ts}  -  {it.get('title','')}")
+
+    # ----- フリースペース -----
+    def _on_free_html_changed(self):
+        # 保存直前に外部参照を dataURL に置換
+        self.state["memo2"]["html"] = inline_external_images(self.memoFree.toHtml())
+        self._save_all()
+
+    # ----- 共通 -----
     def _bring_front(self):
         self.showNormal(); self.raise_(); self.activateWindow()
     def _save_all(self):
@@ -950,18 +1026,8 @@ class MainWindow(QtWidgets.QMainWindow):
 def main():
     install_excepthook()
     app = QtWidgets.QApplication(sys.argv)
-
-    # タスクトレイ用の簡易アイコン（生成）
-    pm = QtGui.QPixmap(32, 32); pm.fill(QtCore.Qt.GlobalColor.transparent)
-    p = QtGui.QPainter(pm); p.setRenderHint(QtGui.QPainter.Antialiasing, True)
-    p.setBrush(QtGui.QBrush(QtGui.QColor("#4F8AF3"))); p.setPen(QtGui.QPen(QtGui.QColor("#2c5fb8"), 1))
-    p.drawRoundedRect(1,1,30,30,6,6)
-    p.setPen(QtGui.QPen(QtCore.Qt.white, 2)); p.drawText(QtCore.QRectF(0,0,32,32), QtCore.Qt.AlignCenter, "B")
-    p.end()
-    icon = QtGui.QIcon(pm)
-
     app.setApplicationName(APP_TITLE)
-    w = MainWindow(icon); w.show()
+    w = MainWindow(); w.show()
     sys.exit(app.exec())
 
 if __name__ == "__main__":
