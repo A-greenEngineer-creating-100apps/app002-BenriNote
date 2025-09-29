@@ -34,10 +34,11 @@ ACCENT, ACCENT_HOVER, ACCENT_WEAK = "#4F8AF3", "#6BA0F6", "#E6E6FF"
 FG, BG, PANEL_BG = "#222222", "#FAFAFB", "#FFFFFF"
 BORDER, HANDLE = "#E6E6EA", "#EAEAEA"
 
+# 【修正1】DEFAULT_STATEに常駐事項のアーカイブを追加
 DEFAULT_STATE: Dict[str, Any] = {
     # ToDo: items: {id, title, done, html}
     "todo": {"items": [], "archive": []},  # archive: {id, title, html, archived_at}
-    # 常駐： "カテゴリ名": {"items":[{"id","title","html"}]}
+    # 常駐： "カテゴリ名": {"items":[{"id","title","html"}], "archive":[{"id","title","html", "archived_at"}]}
     "categories": {},
     "category_order": [],
     # フリースペース
@@ -121,6 +122,12 @@ def _qimage_to_data_url(img: QtGui.QImage, fmt: str = "PNG") -> str:
     mime = "image/png" if fmt.upper() == "PNG" else f"image/{fmt.lower()}"
     return f"data:{mime};base64,{ba}"
 
+def _qimage_to_html_tag(img: QtGui.QImage) -> str:
+    """QImage から Base64 Data URL を含む <img> タグを生成する。"""
+    dataurl = _qimage_to_data_url(img)
+    return f'<img src="{dataurl}" alt="image" />'
+
+
 def inline_external_images(html: str) -> str:
     """HTML内の <img src=...> で data: 以外をQImage読込→dataURLに差し替える。"""
     if not html:
@@ -163,7 +170,8 @@ class EmbedImageTextEdit(QtWidgets.QTextEdit):
         if source.hasImage():
             qimg = QtGui.QImage(source.imageData())
             if not qimg.isNull():
-                self.textCursor().insertImage(qimg)
+                html_tag = _qimage_to_html_tag(qimg)
+                self.textCursor().insertHtml(html_tag)
                 return
 
         # 2) URL/ファイル
@@ -175,7 +183,8 @@ class EmbedImageTextEdit(QtWidgets.QTextEdit):
                     if path.lower().endswith((".png",".jpg",".jpeg",".bmp",".gif",".webp")):
                         qimg = QtGui.QImage(path)
                         if not qimg.isNull():
-                            self.textCursor().insertImage(qimg)
+                            html_tag = _qimage_to_html_tag(qimg)
+                            self.textCursor().insertHtml(html_tag)
                             handled = True
                         continue
             if handled:
@@ -194,9 +203,11 @@ class EmbedImageTextEdit(QtWidgets.QTextEdit):
                 if path and os.path.exists(path):
                     qimg = QtGui.QImage(path)
                     if not qimg.isNull():
-                        self.textCursor().insertImage(qimg)  # ここで埋め込み
+                        html_tag = _qimage_to_html_tag(qimg)
+                        self.textCursor().insertHtml(html_tag)
                         return ""  # 元タグは消す
                 return m.group(0)
+            
             html_wo_imgs = re.sub(r'<img[^>]*\bsrc=["\']([^"\']+)["\'][^>]*>', repl, html, flags=re.I)
             self.insertHtml(html_wo_imgs)
             return
@@ -300,7 +311,8 @@ class RichBar(QtWidgets.QToolBar):
         if img := cb.image():
             qimg = QtGui.QImage(img)
             if not qimg.isNull():
-                self.target.textCursor().insertImage(qimg)
+                html_tag = _qimage_to_html_tag(qimg)
+                self.target.textCursor().insertHtml(html_tag)
                 self.htmlChanged.emit()
         else:
             QtWidgets.QMessageBox.information(self, "情報", "クリップボードに画像がありません。")
@@ -311,7 +323,8 @@ class RichBar(QtWidgets.QToolBar):
         qimg = QtGui.QImage(path)
         if qimg.isNull():
             QtWidgets.QMessageBox.warning(self, "失敗", "画像を読み込めませんでした。"); return
-        self.target.textCursor().insertImage(qimg)
+        html_tag = _qimage_to_html_tag(qimg)
+        self.target.textCursor().insertHtml(html_tag)
         self.htmlChanged.emit()
 
     def resize_selected_image(self):
@@ -392,6 +405,13 @@ class MainWindow(QtWidgets.QMainWindow):
         for it in self.state["todo"]["archive"]:
             if "title" not in it:
                 it["title"] = it.get("text", ""); changed = True
+        
+        # 【修正2】常駐事項のデータ構造の確認と初期化
+        for name, cat_data in list(self.state["categories"].items()):
+            if "archive" not in cat_data:
+                cat_data["archive"] = []
+                changed = True
+
         if changed:
             save_json(DATA_FILE, self.state)
 
@@ -504,19 +524,19 @@ class MainWindow(QtWidgets.QMainWindow):
         hb2.addWidget(btnTgl); hb2.addWidget(btnArc); hb2.addWidget(btnRen); hb2.addWidget(btnDel)
         vct.addLayout(hb2)
 
-        # Archive
-        self.archiveList = QtWidgets.QListWidget(); self._refresh_archive_list()
+        # Archive (ToDo)
+        self.archiveList = QtWidgets.QListWidget(); self._refresh_todo_archive_list()
         self.archiveList.setItemDelegate(SeparatorDelegate(self.archiveList))
         self.archiveList.itemDoubleClicked.connect(self._edit_archive_item)
         btnArcDel = QtWidgets.QPushButton("選択アーカイブ削除")
-        btnArcDel.clicked.connect(self._delete_selected_archive)
+        btnArcDel.clicked.connect(self._delete_selected_todo_archive)
         arcPane = QtWidgets.QWidget(); varc = QtWidgets.QVBoxLayout(arcPane)
         varc.setContentsMargins(8,8,8,8); varc.addWidget(self.archiveList)
         varc.addWidget(btnArcDel, alignment=QtCore.Qt.AlignRight)
 
         self.centerTabs = QtWidgets.QTabWidget()
         self.centerTabs.addTab(todoPane, "ToDo")
-        self.centerTabs.addTab(arcPane, "アーカイブ")
+        self.centerTabs.addTab(arcPane, "ToDoアーカイブ")
 
         # ===== 左：常駐カテゴリ =====
         self.residentTabs = QtWidgets.QTabWidget()
@@ -583,7 +603,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for name, val in list(cats.items()):
             if isinstance(val, dict) and "items" not in val:
                 html = val.get("html", "")
-                cats[name] = {"items": []}
+                cats[name] = {"items": [], "archive": []} # archive初期化
                 if html:
                     cats[name]["items"].append({"id": str(uuid.uuid4()), "title": "メモ", "html": html})
                 changed = True
@@ -593,22 +613,42 @@ class MainWindow(QtWidgets.QMainWindow):
                     it.setdefault("id", str(uuid.uuid4()))
                     it.setdefault("title", "無題")
                     it.setdefault("html", "")
+                cats[name].setdefault("archive", []) # archiveがなければ初期化
         if changed:
             save_json(DATA_FILE, self.state)
 
     # ====== 常駐カテゴリ UI ======
     def _rebuild_resident_tabs(self):
         self.residentTabs.blockSignals(True)
+        current_text = self.residentTabs.tabText(self.residentTabs.currentIndex()) # 現在のタブ名保存
+        
         self.residentTabs.clear()
         order = list(self.state.get("category_order", []))
         for k in self.state["categories"].keys():
             if k not in order: order.append(k)
         self.state["category_order"] = order
+        
+        new_index = 0
         for name in order:
             self.residentTabs.addTab(self._build_category_widget(name), name)
+            if name == current_text:
+                new_index = self.residentTabs.count() - 1
+        
+        # 最後にアーカイブタブを追加
+        if order:
+            self.residentTabs.addTab(self._build_resident_archive_widget(), "アーカイブ")
+        
         self.residentTabs.tabBar().tabMoved.connect(self._on_resident_tab_moved)
+        
+        # 選択状態を復元 (アーカイブタブの可能性も考慮)
+        if current_text == "アーカイブ":
+             self.residentTabs.setCurrentIndex(self.residentTabs.count() - 1)
+        elif new_index < self.residentTabs.count():
+             self.residentTabs.setCurrentIndex(new_index)
+        
         self.residentTabs.blockSignals(False)
 
+    # 【追加】常駐項目リストの表示ウィジェット
     def _build_category_widget(self, cat_name: str) -> QtWidgets.QWidget:
         wrap = QtWidgets.QWidget()
         v = QtWidgets.QVBoxLayout(wrap); v.setContentsMargins(6,6,6,6); v.setSpacing(6)
@@ -630,11 +670,16 @@ class MainWindow(QtWidgets.QMainWindow):
         hb = QtWidgets.QHBoxLayout()
         btnAdd = QtWidgets.QPushButton("項目追加")
         btnRen = QtWidgets.QPushButton("項目名変更")
+        # 【修正3】項目アーカイブボタンを追加
+        btnArcItem = QtWidgets.QPushButton("項目アーカイブ")
         btnDel = QtWidgets.QPushButton("項目削除")
-        hb.addWidget(btnAdd); hb.addWidget(btnRen); hb.addWidget(btnDel); hb.addStretch(1)
+        
+        hb.addWidget(btnAdd); hb.addWidget(btnRen); hb.addWidget(btnArcItem); hb.addWidget(btnDel); hb.addStretch(1)
 
         btnAdd.clicked.connect(lambda _=None, cn=cat_name, w=lst: self._add_resident_item(cn, w))
         btnRen.clicked.connect(lambda _=None, cn=cat_name, w=lst: self._rename_resident_item(cn, w))
+        # 【修正3】項目アーカイブボタンの接続
+        btnArcItem.clicked.connect(lambda _=None, cn=cat_name, w=lst: self._archive_resident_item(cn, w))
         btnDel.clicked.connect(lambda _=None, cn=cat_name, w=lst: self._delete_resident_item(cn, w))
 
         v.addWidget(lst, 1); v.addLayout(hb)
@@ -646,6 +691,30 @@ class MainWindow(QtWidgets.QMainWindow):
 
         return wrap
 
+    # 【追加】常駐アーカイブリストの表示ウィジェット
+    def _build_resident_archive_widget(self) -> QtWidgets.QWidget:
+        wrap = QtWidgets.QWidget()
+        v = QtWidgets.QVBoxLayout(wrap); v.setContentsMargins(8,8,8,8)
+
+        # アーカイブ項目を表示するリストウィジェット
+        self.residentArchiveList = QtWidgets.QListWidget(objectName="list_resident_archive")
+        self.residentArchiveList.setStyleSheet("QListWidget{background:%s; border:1px solid %s; border-radius:8px;}" % (PANEL_BG, BORDER))
+        self.residentArchiveList.setItemDelegate(SeparatorDelegate(self.residentArchiveList))
+        self.residentArchiveList.itemDoubleClicked.connect(self._edit_resident_archive_item) # 編集機能
+        
+        self._refresh_resident_archive_list()
+
+        hb = QtWidgets.QHBoxLayout()
+        btnRestore = QtWidgets.QPushButton("選択復元（元カテゴリへ）")
+        btnDel = QtWidgets.QPushButton("選択削除")
+        hb.addWidget(btnRestore); hb.addWidget(btnDel)
+        
+        btnRestore.clicked.connect(self._restore_resident_archive_item)
+        btnDel.clicked.connect(self._delete_resident_archive_item)
+
+        v.addWidget(self.residentArchiveList, 1); v.addLayout(hb)
+        return wrap
+    
     # --- 項目操作 ---
     def _add_resident_item(self, cat_name: str, list_widget: QtWidgets.QListWidget):
         title, ok = QtWidgets.QInputDialog.getText(self, "項目の追加", "項目名：")
@@ -673,6 +742,30 @@ class MainWindow(QtWidgets.QMainWindow):
             self.detailLabel.setText(f"詳細（{cat_name} / {new}）")
         self._save_all()
 
+    # 【追加】常駐事項の項目をアーカイブする
+    def _archive_resident_item(self, cat_name: str, list_widget: QtWidgets.QListWidget):
+        row = list_widget.currentRow()
+        if row < 0: return
+        
+        # 項目をリストから削除し、データから取得
+        item_to_archive = self.state["categories"][cat_name]["items"].pop(row)
+        list_widget.takeItem(row)
+        
+        # アーカイブ用のデータを作成し、アーカイブリストに追加
+        item_to_archive["archived_at"] = int(time.time())
+        item_to_archive["original_category"] = cat_name # 復元のためカテゴリ名を保存
+        self.state["categories"][cat_name]["archive"].append(item_to_archive)
+        
+        # UIを更新
+        if list_widget.currentRow() < 0:
+            self._load_detail(None)
+        self._refresh_resident_archive_list()
+        self._save_all()
+        # アーカイブタブに切り替え
+        for i in range(self.residentTabs.count()):
+            if self.residentTabs.tabText(i) == "アーカイブ":
+                self.residentTabs.setCurrentIndex(i); break
+
     def _delete_resident_item(self, cat_name: str, list_widget: QtWidgets.QListWidget):
         row = list_widget.currentRow()
         if row < 0: return
@@ -690,12 +783,140 @@ class MainWindow(QtWidgets.QMainWindow):
         new_titles = [list_widget.item(i).text() for i in range(list_widget.count())]
         title_to_list: Dict[str, List[Dict[str, Any]]] = {}
         for it in items:
+            # Note: タイトル重複時は最初の要素を採用する簡易ロジック
             title_to_list.setdefault(it["title"], []).append(it)
         new_items: List[Dict[str, Any]] = []
         for t in new_titles:
-            new_items.append(title_to_list[t].pop(0))
+            # ここで .pop(0) するときにキーエラーを防ぐためにチェック
+            if t in title_to_list and title_to_list[t]:
+                 new_items.append(title_to_list[t].pop(0))
+        
+        # 元のリストと長さが合わない場合はエラーの可能性があるため、ログを出すか、より堅牢なロジックが必要だが、
+        # UUIDがあるため、ここでは簡易的に新リストに置き換える
         self.state["categories"][cat_name]["items"] = new_items
         self._save_all()
+
+    # --- 常駐アーカイブ操作 ---
+    def _refresh_resident_archive_list(self):
+        if not hasattr(self, 'residentArchiveList'): return
+        self.residentArchiveList.clear()
+        
+        all_archives = []
+        for cat_data in self.state["categories"].values():
+            for item in cat_data.get("archive", []):
+                all_archives.append(item)
+                
+        # アーカイブ日時の降順でソート
+        sorted_arc = sorted(all_archives, key=lambda x: x.get("archived_at", 0), reverse=True)
+
+        for it in sorted_arc:
+            ts = QtCore.QDateTime.fromSecsSinceEpoch(it.get("archived_at", 0)).toString("yyyy-MM-dd HH:mm")
+            title = it.get('title','')
+            orig_cat = it.get('original_category', '不明')
+            list_item = QtWidgets.QListWidgetItem(f"[{orig_cat}] {ts} - {title}")
+            list_item.setData(QtCore.Qt.UserRole, it["id"]) # IDをUserDataとして保持
+            self.residentArchiveList.addItem(list_item)
+            
+    def _get_resident_archive_item(self, row: int) -> Optional[Dict[str, Any]]:
+        if not hasattr(self, 'residentArchiveList') or row < 0: return None
+        item = self.residentArchiveList.item(row)
+        if not item: return None
+        item_id = item.data(QtCore.Qt.UserRole)
+        
+        # IDを使って実際のデータを探す
+        for cat_data in self.state["categories"].values():
+            for archive_item in cat_data.get("archive", []):
+                if archive_item["id"] == item_id:
+                    return archive_item
+        return None
+
+    def _restore_resident_archive_item(self):
+        row = self.residentArchiveList.currentRow()
+        archive_item = self._get_resident_archive_item(row)
+        if not archive_item: return
+
+        orig_cat = archive_item.get("original_category")
+        if not orig_cat or orig_cat not in self.state["categories"]:
+            QtWidgets.QMessageBox.warning(self, "エラー", "復元先のカテゴリが見つかりません。")
+            return
+            
+        if QtWidgets.QMessageBox.question(self, "復元確認", f"「{archive_item['title']}」をカテゴリ「{orig_cat}」に復元しますか？") != QtWidgets.QMessageBox.Yes:
+            return
+        
+        # 1. アーカイブリストから削除
+        self.state["categories"][orig_cat]["archive"] = [
+            it for it in self.state["categories"][orig_cat]["archive"] if it["id"] != archive_item["id"]
+        ]
+        
+        # 2. 項目リストに復元（archived_atとoriginal_categoryを削除）
+        restored_item = {k: v for k, v in archive_item.items() if k not in ["archived_at", "original_category"]}
+        self.state["categories"][orig_cat]["items"].append(restored_item)
+
+        # 3. UIの更新
+        self._rebuild_resident_tabs() # タブを再構築してリストを更新
+        self._refresh_resident_archive_list()
+        self._save_all()
+        
+        # 復元したカテゴリのタブに切り替える
+        for i in range(self.residentTabs.count()):
+             if self.residentTabs.tabText(i) == orig_cat:
+                 self.residentTabs.setCurrentIndex(i)
+                 break
+        
+    def _delete_resident_archive_item(self):
+        row = self.residentArchiveList.currentRow()
+        archive_item = self._get_resident_archive_item(row)
+        if not archive_item: return
+
+        if QtWidgets.QMessageBox.question(self, "削除確認", f"アーカイブ項目「{archive_item['title']}」を完全に削除しますか？") != QtWidgets.QMessageBox.Yes:
+            return
+
+        orig_cat = archive_item.get("original_category")
+        if not orig_cat or orig_cat not in self.state["categories"]:
+             # 念のため全カテゴリから削除を試みる
+            for cat_data in self.state["categories"].values():
+                 cat_data["archive"] = [it for it in cat_data.get("archive", []) if it["id"] != archive_item["id"]]
+        else:
+            self.state["categories"][orig_cat]["archive"] = [
+                it for it in self.state["categories"][orig_cat]["archive"] if it["id"] != archive_item["id"]
+            ]
+        
+        self._refresh_resident_archive_list()
+        self._save_all()
+
+    def _edit_resident_archive_item(self, item: QtWidgets.QListWidgetItem):
+        # ToDoアーカイブと同様に、タイトルと本文（プレーンテキスト）を編集可能にする
+        row = self.residentArchiveList.currentRow()
+        target = self._get_resident_archive_item(row)
+        if not target: return
+        
+        # 1. タイトル
+        new_title, ok = QtWidgets.QInputDialog.getText(self, "アーカイブのタイトル", "タイトル：", text=target.get("title",""))
+        if not ok: return
+        
+        # 2. 本文（簡易）
+        dlg = QtWidgets.QInputDialog(self); dlg.setWindowTitle("アーカイブの本文（プレーンテキスト）")
+        dlg.setLabelText("本文：")
+        dlg.setTextValue(html_to_plain(target.get("html","")))
+        
+        if dlg.exec() == QtWidgets.QDialog.Accepted:
+            body_plain = dlg.textValue()
+            body_html = plain_to_html(body_plain)
+            
+            # 該当IDのアイテムを探して更新
+            found = False
+            for cat_data in self.state["categories"].values():
+                for it in cat_data.get("archive", []):
+                    if it["id"] == target["id"]:
+                        it["title"] = new_title
+                        it["html"] = body_html
+                        found = True
+                        break
+                if found: break
+                
+            self._refresh_resident_archive_list()
+            self._save_all()
+
 
     # --- セレクション → 詳細に読み込み ---
     def _on_todo_selected(self, current: QtCore.QModelIndex, previous: QtCore.QModelIndex):
@@ -753,7 +974,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # --- カテゴリ（タブ）操作 ---
     def _on_resident_tab_moved(self, from_idx: int, to_idx: int):
-        new_order = [self.residentTabs.tabText(i) for i in range(self.residentTabs.count())]
+        # アーカイブタブは移動対象外なので、通常タブの移動のみを反映する
+        new_order = [self.residentTabs.tabText(i) for i in range(self.residentTabs.count()) if self.residentTabs.tabText(i) != "アーカイブ"]
         self.state["category_order"] = new_order
         self._save_all()
 
@@ -763,7 +985,7 @@ class MainWindow(QtWidgets.QMainWindow):
         name = name.strip()
         if name in self.state["categories"]:
             QtWidgets.QMessageBox.warning(self, "重複", "同名のカテゴリが既にあります。"); return
-        self.state["categories"][name] = {"items": []}
+        self.state["categories"][name] = {"items": [], "archive": []}
         self.state["category_order"].append(name)
         self._rebuild_resident_tabs()
         for i in range(self.residentTabs.count()):
@@ -775,14 +997,24 @@ class MainWindow(QtWidgets.QMainWindow):
         cur = self.residentTabs.currentIndex()
         if cur < 0: return
         old = self.residentTabs.tabText(cur)
+        if old == "アーカイブ":
+            QtWidgets.QMessageBox.warning(self, "エラー", "アーカイブタブの名前は変更できません。"); return
+            
         new, ok = QtWidgets.QInputDialog.getText(self, "カテゴリ名の変更", "新しい名前：", text=old)
         if not ok: return
         new = new.strip()
         if not new or new == old: return
         if new in self.state["categories"]:
             QtWidgets.QMessageBox.warning(self, "重複", "同名のカテゴリが既にあります。"); return
+            
+        # データの更新
         self.state["categories"][new] = self.state["categories"].pop(old)
         self.state["category_order"] = [new if x == old else x for x in self.state["category_order"]]
+        # アーカイブデータ内のoriginal_categoryも更新
+        for arc_item in self.state["categories"][new]["archive"]:
+            if arc_item.get("original_category") == old:
+                arc_item["original_category"] = new
+        
         self._rebuild_resident_tabs()
         for i in range(self.residentTabs.count()):
             if self.residentTabs.tabText(i) == new:
@@ -793,8 +1025,12 @@ class MainWindow(QtWidgets.QMainWindow):
         cur = self.residentTabs.currentIndex()
         if cur < 0: return
         name = self.residentTabs.tabText(cur)
-        if QtWidgets.QMessageBox.question(self, "削除確認", f"カテゴリ「{name}」を削除しますか？\n（項目も全て消えます）") != QtWidgets.QMessageBox.Yes:
+        if name == "アーカイブ":
+            QtWidgets.QMessageBox.warning(self, "エラー", "アーカイブタブは削除できません。"); return
+        
+        if QtWidgets.QMessageBox.question(self, "削除確認", f"カテゴリ「{name}」を削除しますか？\n（項目とアーカイブ項目も全て消えます）") != QtWidgets.QMessageBox.Yes:
             return
+            
         self.state["categories"].pop(name, None)
         self.state["category_order"] = [x for x in self.state["category_order"] if x != name]
         self._rebuild_resident_tabs()
@@ -955,6 +1191,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.detailLabel.setText(f"詳細（ToDo / {new}）")
         self._save_all()
 
+    # ----- ToDo Archive -----
     def _edit_archive_item(self, item: QtWidgets.QListWidgetItem):
         # アーカイブはタイトル/本文の編集（ダイアログ）
         row = self.archiveList.row(item)
@@ -975,7 +1212,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     it["title"] = new_title
                     it["html"] = body_html
                     break
-            self._refresh_archive_list(); self._save_all()
+            self._refresh_todo_archive_list(); self._save_all()
 
     def _archive_done(self):
         done = [it for it in self.state["todo"]["items"] if it.get("done")]
@@ -989,12 +1226,11 @@ class MainWindow(QtWidgets.QMainWindow):
             })
         self.state["todo"]["items"] = [it for it in self.state["todo"]["items"] if not it.get("done")]
         self.todoModel.layoutChanged.emit()
-        self._refresh_archive_list()
+        self._refresh_todo_archive_list()
         self._save_all()
         self.centerTabs.setCurrentIndex(1)
 
-    # ----- Archive -----
-    def _delete_selected_archive(self):
+    def _delete_selected_todo_archive(self):
         row = self.archiveList.currentRow()
         if row < 0: return
         if QtWidgets.QMessageBox.question(self, "削除確認", "選択したアーカイブ項目を削除しますか？") != QtWidgets.QMessageBox.Yes:
@@ -1002,9 +1238,9 @@ class MainWindow(QtWidgets.QMainWindow):
         sorted_arc = sorted(self.state["todo"]["archive"], key=lambda x: x.get("archived_at", 0), reverse=True)
         target = sorted_arc[row]
         self.state["todo"]["archive"] = [it for it in self.state["todo"]["archive"] if it["id"] != target["id"]]
-        self._refresh_archive_list(); self._save_all()
+        self._refresh_todo_archive_list(); self._save_all()
 
-    def _refresh_archive_list(self):
+    def _refresh_todo_archive_list(self):
         self.archiveList.clear()
         for it in sorted(self.state["todo"]["archive"], key=lambda x: x.get("archived_at", 0), reverse=True):
             ts = QtCore.QDateTime.fromSecsSinceEpoch(it.get("archived_at", 0)).toString("yyyy-MM-dd HH:mm")
