@@ -1,7 +1,3 @@
-# =========================================================
-# Ver1.7
-# =========================================================
-
 from __future__ import annotations
 import json, os, sys, uuid, time, re, traceback
 from typing import Dict, Any, List, Optional, Tuple
@@ -10,14 +6,14 @@ from datetime import datetime
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-APP_TITLE = "便利ノート Ver1.7"
+APP_TITLE = "めもめも"
 
 # 保存先（Winなら %LOCALAPPDATA%\BenriNote）
-DATA_DIR  = Path(os.getenv("LOCALAPPDATA", str(Path.home()))) / "BenriNote"
+DATA_DIR = Path(os.getenv("LOCALAPPDATA", str(Path.home()))) / "BenriNote"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DATA_FILE = DATA_DIR / "notes.json"
 CONF_FILE = DATA_DIR / "window.json"
-LOG_FILE  = DATA_DIR / "error.log"
+LOG_FILE = DATA_DIR / "error.log"
 
 # ===== Theme =====
 ACCENT, ACCENT_HOVER, ACCENT_WEAK = "#4F8AF3", "#6BA0F6", "#E6E6FF"
@@ -73,66 +69,8 @@ def html_to_plain(html: str) -> str:
     return txt.strip()
 
 # =========================================================
-# ToDoモデル（編集・色付き対応版）
+# 画像埋め込み / 区切り線 / リンク対応テキストエディタ
 # =========================================================
-class TodoModel(QtCore.QAbstractListModel):
-    def __init__(self, items: List[Dict[str, Any]]):
-        super().__init__(); self.items = items
-
-    def rowCount(self, parent=QtCore.QModelIndex()): 
-        return len(self.items)
-
-    def data(self, index, role):
-        if not index.isValid(): return None
-        it = self.items[index.row()]
-        if role == QtCore.Qt.DisplayRole:
-            return it.get("title","")
-        if role == QtCore.Qt.FontRole and it.get("done"):
-            f = QtGui.QFont(); f.setStrikeOut(True); return f
-        if role == QtCore.Qt.BackgroundRole:
-            col = it.get("color")
-            if col: return QtGui.QBrush(QtGui.QColor(col))
-        return None
-
-    def add(self, text: str, html: str = None):
-        self.beginInsertRows(QtCore.QModelIndex(), len(self.items), len(self.items))
-        self.items.append({
-            "id": str(uuid.uuid4()),
-            "title": text,
-            "done": False,
-            "html": html or "",
-            "color": None,
-        })
-        self.endInsertRows()
-
-    def toggle(self, row: int):
-        if 0 <= row < len(self.items):
-            self.items[row]["done"] = not self.items[row]["done"]
-            self.dataChanged.emit(self.index(row), self.index(row))
-
-    def remove(self, row: int):
-        if 0 <= row < len(self.items):
-            self.beginRemoveRows(QtCore.QModelIndex(), row, row)
-            self.items.pop(row); self.endRemoveRows()
-
-    def flags(self, index):
-        if not index.isValid():
-            return QtCore.Qt.ItemIsEnabled
-        return (QtCore.Qt.ItemIsSelectable | QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsEditable)
-
-    def setData(self, index, value, role):
-        if not index.isValid():
-            return False
-        if role == QtCore.Qt.EditRole:
-            text = str(value).strip()
-            self.items[index.row()]["title"] = text
-            self.dataChanged.emit(index, index)
-            return True
-        return False
-# =========================================================
-# 画像埋め込み / 区切り線 / リッチツールバー / クリックでリンクを開く
-# =========================================================
-
 def _qimage_to_data_url(img: QtGui.QImage, fmt: str = "PNG") -> str:
     buf = QtCore.QBuffer()
     buf.open(QtCore.QIODevice.WriteOnly)
@@ -177,7 +115,7 @@ class SeparatorDelegate(QtWidgets.QStyledItemDelegate):
 class EmbedImageTextEdit(QtWidgets.QTextEdit):
     def canInsertFromMimeData(self, source: QtCore.QMimeData) -> bool:
         return source.hasImage() or source.hasUrls() or source.hasHtml() or source.hasText() or \
-               super().canInsertFromMimeData(source)
+                super().canInsertFromMimeData(source)
 
     def insertFromMimeData(self, source: QtCore.QMimeData):
         if source.hasImage():
@@ -392,7 +330,110 @@ class RichBar(QtWidgets.QToolBar):
             self.target.textCursor().insertHtml(html)
 
 # =========================================================
-# MainWindow（前半：UI構築）
+# 常駐事項リスト（ドラッグ&ドロップ後のデータ同期用）
+# =========================================================
+class ResidentListWidget(QtWidgets.QListWidget):
+    """
+    常駐事項の項目リスト。
+    項目のドラッグ＆ドロップ移動が完了した後、親ウィジェットのデータ順序を同期するために dropEvent をオーバーライドする。
+    """
+    # 📌 修正箇所: **kwargs を追加し、super().__init__ に渡す
+    def __init__(self, cat_name: str, main_window: 'MainWindow', parent=None, **kwargs):
+        super().__init__(parent, **kwargs) # **kwargs を親クラスに渡す
+        self.cat_name = cat_name
+        self.main_window = main_window
+        self._select_callback = None
+        self._update_order_callback = None
+        
+        # QListWidgetの設定
+        self.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self.setDragDropMode(QtWidgets.QAbstractItemView.InternalMove)
+        self.setDefaultDropAction(QtCore.Qt.MoveAction)
+        self.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+
+    def set_callbacks(self, select_callback, update_order_callback):
+        self._select_callback = select_callback
+        self._update_order_callback = update_order_callback
+        
+        # 通常の選択シグナルをカスタムクラス内で接続
+        self.currentRowChanged.connect(lambda row: self._select_callback(self.cat_name, row))
+        self.itemClicked.connect(lambda _it: self._select_callback(self.cat_name, self.currentRow()))
+
+    def dropEvent(self, event: QtGui.QDropEvent):
+        """アイテムのドロップが完了した際に、基底クラスの処理の後にデータ順序を更新する。"""
+        # 🌟 重要: ドロップ前に現在の詳細エディタの内容を保存しておく
+        self.main_window._apply_detail_to_state()
+        
+        # 基底クラスの dropEvent を呼び出し、アイテムの移動を完了させる
+        super().dropEvent(event)
+        
+        # データ側のリストの順序を、UIの現在の順序に合わせて更新
+        if self._update_order_callback:
+            # 外部 (MainWindow) のメソッドを呼び出してデータ構造を更新する
+            self._update_order_callback(self.cat_name, self)
+        
+        event.accept()
+
+# =========================================================
+# ToDoモデル（編集・色付き対応版）
+# =========================================================
+class TodoModel(QtCore.QAbstractListModel):
+    def __init__(self, items: List[Dict[str, Any]]):
+        super().__init__(); self.items = items
+
+    def rowCount(self, parent=QtCore.QModelIndex()): 
+        return len(self.items)
+
+    def data(self, index, role):
+        if not index.isValid(): return None
+        it = self.items[index.row()]
+        if role == QtCore.Qt.DisplayRole:
+            return it.get("title","")
+        if role == QtCore.Qt.FontRole and it.get("done"):
+            f = QtGui.QFont(); f.setStrikeOut(True); return f
+        if role == QtCore.Qt.BackgroundRole:
+            col = it.get("color")
+            if col: return QtGui.QBrush(QtGui.QColor(col))
+        return None
+
+    def add(self, text: str, html: str = None):
+        self.beginInsertRows(QtCore.QModelIndex(), len(self.items), len(self.items))
+        self.items.append({
+            "id": str(uuid.uuid4()),
+            "title": text,
+            "done": False,
+            "html": html or "",
+            "color": None,
+        })
+        self.endInsertRows()
+
+    def toggle(self, row: int):
+        if 0 <= row < len(self.items):
+            self.items[row]["done"] = not self.items[row]["done"]
+            self.dataChanged.emit(self.index(row), self.index(row))
+
+    def remove(self, row: int):
+        if 0 <= row < len(self.items):
+            self.beginRemoveRows(QtCore.QModelIndex(), row, row)
+            self.items.pop(row); self.endRemoveRows()
+
+    def flags(self, index):
+        if not index.isValid():
+            return QtCore.Qt.ItemIsEnabled
+        return (QtCore.Qt.ItemIsSelectable | QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsEditable)
+
+    def setData(self, index, value, role):
+        if not index.isValid():
+            return False
+        if role == QtCore.Qt.EditRole:
+            text = str(value).strip()
+            self.items[index.row()]["title"] = text
+            self.dataChanged.emit(index, index)
+            return True
+        return False
+
+# =========================================================
+# デフォルト状態
 # =========================================================
 DEFAULT_STATE: Dict[str, Any] = {
     "todo": {"items": [], "archive": []},
@@ -401,15 +442,19 @@ DEFAULT_STATE: Dict[str, Any] = {
     "memo2": {"html": ""},
 }
 
+# =========================================================
+# MainWindow（UI構築〜起動直後セットアップ）
+# =========================================================
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(APP_TITLE)
         self.setWindowIcon(QtGui.QIcon.fromTheme("sticky-notes"))
         self.prev_geometry: Optional[QtCore.QRect] = None
+        self._detail_ref_uuid: Optional[str] = None # 📌 追加: 常駐事項の選択UUIDを保持
 
         self.state = load_json(DATA_FILE, DEFAULT_STATE)
-        self.conf  = load_json(CONF_FILE, {"geometry": None})
+        self.conf = load_json(CONF_FILE, {"geometry": None})
 
         # 旧データのtitle移行 & 常駐構造の整備
         changed = False
@@ -419,6 +464,9 @@ class MainWindow(QtWidgets.QMainWindow):
             if "title" not in it: it["title"] = it.get("text",""); changed = True
         for name, cat in list(self.state["categories"].items()):
             cat.setdefault("items", []); cat.setdefault("archive", [])
+            # 既存の項目にUUIDがない場合は付与（バグ修正対応）
+            for item in cat["items"]:
+                item.setdefault("id", str(uuid.uuid4())); changed = True
         if changed: save_json(DATA_FILE, self.state)
 
         self._apply_global_style()
@@ -507,7 +555,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # ===== 左：ToDo / アーカイブ =====
         self.todoModel = TodoModel(self.state["todo"]["items"])
-        self.todoList  = QtWidgets.QListView(); self.todoList.setModel(self.todoModel)
+        self.todoList = QtWidgets.QListView(); self.todoList.setModel(self.todoModel)
         self.todoList.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
         self.todoList.setEditTriggers(QtWidgets.QAbstractItemView.DoubleClicked | QtWidgets.QAbstractItemView.EditKeyPressed)
         self.todoList.setItemDelegate(SeparatorDelegate(self.todoList))
@@ -526,7 +574,7 @@ class MainWindow(QtWidgets.QMainWindow):
         btnTgl.clicked.connect(self._toggle_selected_todo)
         btnDel.clicked.connect(self._del_selected_todo)
         btnArc.clicked.connect(self._archive_done)
-        btnRen.clicked.connect(self._rename_selected_todo)   # ← ボタン版も有効
+        btnRen.clicked.connect(self._rename_selected_todo)  # ← ボタン版も有効
         btnColor.clicked.connect(self._pick_color_for_selected_todo)
 
         todoPane = QtWidgets.QWidget(); vct = QtWidgets.QVBoxLayout(todoPane)
@@ -620,10 +668,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # ▼ 起動時に前回ページ復元
         self._restore_last_state()
-        # ===== 初期表示を調整 =====
-        # 必要に応じて70%サイズトグルなどはダブルクリックで
-        # （イベントフィルタは既に topBar に設定済み）
-
     # ====== 常駐カテゴリ：データ移行（後方互換） ======
     def _migrate_categories_to_items(self):
         changed = False
@@ -665,6 +709,11 @@ class MainWindow(QtWidgets.QMainWindow):
         if order:
             self.residentTabs.addTab(self._build_resident_archive_widget(), "アーカイブ")
 
+        # タブの移動シグナルを再接続
+        try:
+             self.residentTabs.tabBar().tabMoved.disconnect()
+        except TypeError:
+             pass
         self.residentTabs.tabBar().tabMoved.connect(self._on_resident_tab_moved)
 
         if current_text == "アーカイブ":
@@ -677,19 +726,17 @@ class MainWindow(QtWidgets.QMainWindow):
         wrap = QtWidgets.QWidget()
         v = QtWidgets.QVBoxLayout(wrap); v.setContentsMargins(6,6,6,6); v.setSpacing(6)
 
-        lst = QtWidgets.QListWidget(objectName=f"list_{cat_name}")
+        lst = ResidentListWidget(cat_name, self, objectName=f"list_{cat_name}") 
         lst.setStyleSheet(f"QListWidget{{background:{PANEL_BG}; border:1px solid {BORDER}; border-radius:8px;}}")
-        lst.setDragDropMode(QtWidgets.QAbstractItemView.InternalMove)
-        lst.setDefaultDropAction(QtCore.Qt.MoveAction)
-        lst.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         lst.setItemDelegate(SeparatorDelegate(lst))
 
-        lst.currentRowChanged.connect(lambda row, cn=cat_name: self._on_resident_selected(cn, row))
-        lst.itemClicked.connect(lambda _it, cn=cat_name, w=lst: self._on_resident_selected(cn, w.currentRow()))
-        lst.model().rowsMoved.connect(lambda *_a, cn=cat_name, w=lst: self._on_resident_item_rows_moved(cn, w))
+        lst.set_callbacks(self._on_resident_selected, self._update_resident_items_order_from_list) 
 
+        # ▼ UUIDを QListWidgetItem に埋める（順序安定）
         for it in self.state["categories"].get(cat_name, {}).get("items", []):
-            lst.addItem(it.get("title", "無題"))
+            itemw = QtWidgets.QListWidgetItem(it.get("title", "無題"))
+            itemw.setData(QtCore.Qt.UserRole, it.get("id"))
+            lst.addItem(itemw)
 
         hb = QtWidgets.QHBoxLayout()
         btnAdd = QtWidgets.QPushButton("項目追加")
@@ -705,10 +752,22 @@ class MainWindow(QtWidgets.QMainWindow):
 
         v.addWidget(lst, 1); v.addLayout(hb)
 
-        if lst.count() > 0:
+        # 🌟 修正: 選択状態の復元（前回選択していたUUIDに基づいて）
+        initial_row = -1
+        if self._detail_ref_uuid:
+            for i in range(lst.count()):
+                if lst.item(i).data(QtCore.Qt.UserRole) == self._detail_ref_uuid:
+                    initial_row = i; break
+        
+        if initial_row >= 0:
+            lst.setCurrentRow(initial_row)
+            # 選択されたら _on_resident_selected が呼ばれるので、ここでは手動で呼ばない
+        elif lst.count() > 0:
             lst.setCurrentRow(0)
-            self._on_resident_selected(cat_name, 0)
-
+            # 選択されたら _on_resident_selected が呼ばれるので、ここでは手動で呼ばない
+        else:
+            self._on_resident_selected(cat_name, -1) # 項目がない場合は詳細をクリア
+        
         return wrap
 
     def _build_resident_archive_widget(self) -> QtWidgets.QWidget:
@@ -734,76 +793,136 @@ class MainWindow(QtWidgets.QMainWindow):
         return wrap
 
     # --- 常駐：項目操作 ---
-    def _add_resident_item(self, cat_name: str, list_widget: QtWidgets.QListWidget):
+    def _add_resident_item(self, cat_name: str, list_widget: ResidentListWidget):
         title, ok = QtWidgets.QInputDialog.getText(self, "項目の追加", "項目名：")
         if not ok or not title.strip(): return
         title = title.strip()
-        item = {"id": str(uuid.uuid4()), "title": title, "html": ""}
+        new_uuid = str(uuid.uuid4())
+        item = {"id": new_uuid, "title": title, "html": ""}
         self.state["categories"][cat_name]["items"].append(item)
-        list_widget.addItem(title)
+
+        # ▼ QListWidgetItem にも id を持たせる
+        list_item = QtWidgets.QListWidgetItem(title)
+        list_item.setData(QtCore.Qt.UserRole, new_uuid)
+        list_widget.addItem(list_item)
+
         row = list_widget.count() - 1
         list_widget.setCurrentRow(row)
         self._on_resident_selected(cat_name, row)
         self._save_all()
         self._save_last_state()
 
-    def _rename_resident_item(self, cat_name: str, list_widget: QtWidgets.QListWidget):
+    def _rename_resident_item(self, cat_name: str, list_widget: ResidentListWidget):
         row = list_widget.currentRow()
         if row < 0: return
-        cur_title = self.state["categories"][cat_name]["items"][row]["title"]
+        item_data = self.state["categories"][cat_name]["items"][row]
+        cur_title = item_data["title"]
+        
         new, ok = QtWidgets.QInputDialog.getText(self, "項目名の変更", "新しい名前：", text=cur_title)
         if not ok: return
         new = new.strip()
         if not new: return
-        self.state["categories"][cat_name]["items"][row]["title"] = new
+        
+        item_data["title"] = new
         list_widget.item(row).setText(new)
-        if self._detail_ref and self._detail_ref[0] == "resident" and self._detail_ref[1] == cat_name and self._detail_ref[2] == row:
-            self.detailLabel.setText(f"詳細（{cat_name} / {new}）")
+        
+        # 🌟 修正: 詳細ラベルの更新もUUIDベースで安全に確認
+        if hasattr(self, "_detail_ref") and self._detail_ref and self._detail_ref[0] == "resident" and self._detail_ref_uuid == item_data["id"]:
+             self.detailLabel.setText(f"詳細（{cat_name} / {new}）")
+             
         self._save_all()
         self._save_last_state()
 
-    def _archive_resident_item(self, cat_name: str, list_widget: QtWidgets.QListWidget):
+    def _archive_resident_item(self, cat_name: str, list_widget: ResidentListWidget):
         row = list_widget.currentRow()
         if row < 0: return
+        
+        # 🌟 修正: 詳細エディタの内容を保存してから操作
+        self._apply_detail_to_state()
+        
         item_to_archive = self.state["categories"][cat_name]["items"].pop(row)
         list_widget.takeItem(row)
         item_to_archive["archived_at"] = int(time.time())
         item_to_archive["original_category"] = cat_name
         self.state["categories"][cat_name]["archive"].append(item_to_archive)
+        
         if list_widget.currentRow() < 0:
             self._load_detail(None)
+        
         self._refresh_resident_archive_list()
         self._save_all()
+        
         for i in range(self.residentTabs.count()):
             if self.residentTabs.tabText(i) == "アーカイブ":
                 self.residentTabs.setCurrentIndex(i); break
 
-    def _delete_resident_item(self, cat_name: str, list_widget: QtWidgets.QListWidget):
+    def _delete_resident_item(self, cat_name: str, list_widget: ResidentListWidget):
         row = list_widget.currentRow()
         if row < 0: return
+        
+        # 🌟 修正: 詳細エディタの内容を保存してから操作
+        self._apply_detail_to_state()
+        
         title = self.state["categories"][cat_name]["items"][row]["title"]
         if QtWidgets.QMessageBox.question(self, "削除確認", f"「{title}」を削除しますか？") != QtWidgets.QMessageBox.Yes:
             return
+            
         self.state["categories"][cat_name]["items"].pop(row)
         list_widget.takeItem(row)
+        
         if list_widget.currentRow() < 0:
             self._load_detail(None)
+            
         self._save_all()
         self._save_last_state()
 
-    def _on_resident_item_rows_moved(self, cat_name: str, list_widget: QtWidgets.QListWidget):
+    # 📌 修正: ドロップ時に呼び出され、データ側の順序をUIに合わせて更新するメソッド
+    def _update_resident_items_order_from_list(self, cat_name: str, list_widget: ResidentListWidget):
+        """リストウィジェットの現在のアイテム順序に基づいて、データ (self.state) の順序を更新する。"""
+        # 🌟 ResidentListWidget の dropEvent で、既に detailEditor の内容は保存済み
+        
         items = self.state["categories"][cat_name]["items"]
-        new_titles = [list_widget.item(i).text() for i in range(list_widget.count())]
-        title_to_list: Dict[str, List[Dict[str, Any]]] = {}
-        for it in items:
-            title_to_list.setdefault(it["title"], []).append(it)
-        new_items: List[Dict[str, Any]] = []
-        for t in new_titles:
-            if t in title_to_list and title_to_list[t]:
-                new_items.append(title_to_list[t].pop(0))
-        self.state["categories"][cat_name]["items"] = new_items
-        self._save_all()
-        self._save_last_state()
+        # UUIDをキーとするアイテムの辞書を作成
+        by_id = {it["id"]: it for it in items}
+        
+        new_items = []
+        for i in range(list_widget.count()):
+            itw = list_widget.item(i)
+            # QListWidgetItemに埋め込んだUUIDを取得
+            iid = itw.data(QtCore.Qt.UserRole)
+            
+            if iid and iid in by_id:
+                new_items.append(by_id[iid])
+            # 整合性チェックは重要だが、移動中に一時的にUUIDがない状態は発生し得ないのでスキップ
+        
+        # UI上のアイテム数とデータ上のアイテム数が一致しているか確認
+        if len(new_items) == len(items) and len(new_items) == list_widget.count():
+            # 順序が正しく反映されていれば、データリストを更新
+            self.state["categories"][cat_name]["items"] = new_items
+            self._save_all()
+            self._save_last_state()
+            
+            # 🌟 最重要修正: 並び替え後、選択中の項目（UUIDベース）を再ロードする
+            # これにより、並び替え前のインデックスで読み書きされる問題を回避
+            
+            current_row = list_widget.currentRow()
+            if current_row >= 0:
+                # 選択中のUUIDを取得
+                selected_item_uuid = list_widget.item(current_row).data(QtCore.Qt.UserRole)
+                # UUIDを元に詳細を再ロード (これが新しい行のデータであることを保証)
+                self._load_detail(("resident", cat_name, selected_item_uuid))
+                self._detail_ref_uuid = selected_item_uuid
+            else:
+                 self._load_detail(None)
+        else:
+            # アイテム数に不整合がある場合は警告 (稀なケース)
+            QtWidgets.QMessageBox.warning(self, "エラー", f"常駐事項の並び替えでデータ不整合が発生しました: {cat_name} (再構築します)")
+            self._rebuild_resident_tabs() 
+
+    # 📌 修正: _on_resident_item_rows_moved はカスタムWidget内のdropEventで代替されるため、処理を削除
+    def _on_resident_item_rows_moved(self, cat_name: str, list_widget: QtWidgets.QListWidget):
+        pass
+
 
     # --- 常駐アーカイブ ---
     def _refresh_resident_archive_list(self):
@@ -882,53 +1001,94 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # --- セレクション → 詳細に読み込み ---
     def _on_todo_selected(self, current: QtCore.QModelIndex, previous: QtCore.QModelIndex):
+        self._detail_ref_uuid = None # ToDo選択時はUUIDをクリア
         self._load_detail(("todo", current.row()) if current.isValid() else None)
         self._save_last_state()
 
+    # 🌟 修正: 常駐事項選択時のロジック変更
     def _on_resident_selected(self, cat_name: str, row: int):
-        self._load_detail(("resident", cat_name, row) if row >= 0 else None)
+        # 選択されたリストアイテムからUUIDを取得
+        selected_item_uuid = None
+        if row >= 0:
+            current_widget = self.residentTabs.currentWidget()
+            lst = current_widget.findChild(ResidentListWidget, f"list_{cat_name}")
+            if lst and lst.item(row):
+                selected_item_uuid = lst.item(row).data(QtCore.Qt.UserRole)
+        
+        self._detail_ref_uuid = selected_item_uuid # 選択UUIDを保持
+        
+        if selected_item_uuid:
+            # UUIDを引数に渡して詳細をロード
+            self._load_detail(("resident", cat_name, selected_item_uuid))
+        else:
+            self._load_detail(None)
+            
         self._save_last_state()
 
     # --- 詳細欄ロード／保存 ---
     def _load_detail(self, ref: Optional[Tuple]):
-        self._apply_detail_to_state()
+        # 🌟 修正: ここで、前の参照先の内容を必ず保存する
+        if hasattr(self, "_detail_ref"):
+            self._apply_detail_to_state()
+            
         self._detail_ref = ref
+        
         if ref is None:
             self.detailLabel.setText("詳細")
             self.detailEditor.blockSignals(True); self.detailEditor.clear()
             self.detailEditor.setPlaceholderText("ToDo または 常駐事項の項目を選択すると、ここで詳細編集できます。")
             self.detailEditor.blockSignals(False); return
+            
         if ref[0] == "todo":
             row = ref[1]
             if 0 <= row < len(self.state["todo"]["items"]):
                 it = self.state["todo"]["items"][row]
                 self.detailLabel.setText(f"詳細（ToDo / {it.get('title','')}）")
                 self.detailEditor.blockSignals(True); self.detailEditor.setHtml(it.get("html", "")); self.detailEditor.blockSignals(False)
-        else:
-            _, cat, row = ref
+        
+        # 🌟 修正: 常駐事項はUUIDベースでデータを検索・読み込み
+        elif ref[0] == "resident":
+            _, cat, item_id = ref
             items = self.state["categories"].get(cat, {}).get("items", [])
-            if 0 <= row < len(items):
-                it = items[row]
-                self.detailLabel.setText(f"詳細（{cat} / {it.get('title','無題')}）")
-                self.detailEditor.blockSignals(True); self.detailEditor.setHtml(it.get("html","")); self.detailEditor.blockSignals(False)
+            item_data = next((it for it in items if it.get("id") == item_id), None)
+            
+            if item_data:
+                self.detailLabel.setText(f"詳細（{cat} / {item_data.get('title','無題')}）")
+                self.detailEditor.blockSignals(True); self.detailEditor.setHtml(item_data.get("html","")); self.detailEditor.blockSignals(False)
+            else:
+                self._load_detail(None) # データが見つからない場合はクリア
+                
 
     def _apply_detail_to_state(self):
+        # 🌟 修正: detail_ref が存在しない場合は何もしない
         if not hasattr(self, "_detail_ref") or not self._detail_ref: return
+        
         html = inline_external_images(self.detailEditor.toHtml())
+        
         if self._detail_ref[0] == "todo":
             row = self._detail_ref[1]
             if 0 <= row < len(self.state["todo"]["items"]):
                 self.state["todo"]["items"][row]["html"] = html
                 self.todoModel.dataChanged.emit(self.todoModel.index(row), self.todoModel.index(row))
-        else:
-            _, cat, row = self._detail_ref
-            items = self.state["categories"][cat]["items"]
-            if 0 <= row < len(items):
-                items[row]["html"] = html
+        
+        # 🌟 修正: 常駐事項はUUIDベースでデータを検索・保存
+        elif self._detail_ref[0] == "resident":
+            # self._detail_ref は ("resident", cat_name, item_id) の形式
+            _, cat, item_id = self._detail_ref 
+            items = self.state["categories"].get(cat, {}).get("items", [])
+            
+            for item in items:
+                if item.get("id") == item_id:
+                    item["html"] = html
+                    break
+                    
         self._save_all()
 
     # --- カテゴリ（タブ）操作 ---
     def _on_resident_tab_moved(self, from_idx: int, to_idx: int):
+        # 🌟 修正: タブを移動する前に、現在の詳細エディタの内容を保存
+        self._apply_detail_to_state()
+        
         new_order = [self.residentTabs.tabText(i) for i in range(self.residentTabs.count()) if self.residentTabs.tabText(i) != "アーカイブ"]
         self.state["category_order"] = new_order; self._save_all(); self._save_last_state()
 
@@ -958,6 +1118,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if not new or new == old: return
         if new in self.state["categories"]:
             QtWidgets.QMessageBox.warning(self, "重複", "同名のカテゴリが既にあります。"); return
+            
+        # 🌟 修正: 詳細エディタの内容を保存してから操作
+        self._apply_detail_to_state()
+        
         self.state["categories"][new] = self.state["categories"].pop(old)
         self.state["category_order"] = [new if x == old else x for x in self.state["category_order"]]
         for arc in self.state["categories"][new]["archive"]:
@@ -977,11 +1141,18 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "エラー", "アーカイブタブは削除できません。"); return
         if QtWidgets.QMessageBox.question(self, "削除確認", f"カテゴリ「{name}」を削除しますか？\n（項目とアーカイブ項目も全て消えます）") != QtWidgets.QMessageBox.Yes:
             return
+            
+        # 🌟 修正: 詳細エディタの内容を保存してから操作
+        self._apply_detail_to_state()
+        
         self.state["categories"].pop(name, None)
         self.state["category_order"] = [x for x in self.state["category_order"] if x != name]
         self._rebuild_resident_tabs()
+        
+        # 削除されたカテゴリの項目が選択されていた場合、詳細をクリア
         if hasattr(self, "_detail_ref") and self._detail_ref and self._detail_ref[0] == "resident" and self._detail_ref[1] == name:
             self._load_detail(None)
+            
         self._save_all(); self._save_last_state()
 
     # ----- Global style -----
@@ -1252,13 +1423,17 @@ class MainWindow(QtWidgets.QMainWindow):
         rt_idx = self.residentTabs.currentIndex()
         rt_name = self.residentTabs.tabText(rt_idx) if rt_idx >= 0 else None
         last["resident_tab"] = rt_name
-        resident_row = -1
+        
+        resident_uuid = None
         if rt_name and rt_name != "アーカイブ":
             cat_widget = self.residentTabs.widget(rt_idx)
-            lst = cat_widget.findChild(QtWidgets.QListWidget, f"list_{rt_name}")
+            lst = cat_widget.findChild(ResidentListWidget, f"list_{rt_name}")
             if lst:
-                resident_row = lst.currentRow()
-        last["resident_row"] = resident_row
+                current_item = lst.currentItem()
+                if current_item:
+                    resident_uuid = current_item.data(QtCore.Qt.UserRole)
+                    
+        last["resident_uuid"] = resident_uuid # 📌 修正: 選択状態をUUIDで保存
         self.conf["last"] = last
         save_json(CONF_FILE, self.conf)
 
@@ -1270,18 +1445,19 @@ class MainWindow(QtWidgets.QMainWindow):
         if 0 <= tr < self.todoModel.rowCount():
             self.todoList.setCurrentIndex(self.todoModel.index(tr))
             self._load_detail(("todo", tr))
+            
         rt_name = last.get("resident_tab")
         if rt_name:
+            # 📌 修正: 選択UUIDをロードし、再構築時に利用
+            self._detail_ref_uuid = last.get("resident_uuid") 
+            
             for i in range(self.residentTabs.count()):
                 if self.residentTabs.tabText(i) == rt_name:
                     self.residentTabs.setCurrentIndex(i); break
-            rr = int(last.get("resident_row", -1))
-            if rt_name != "アーカイブ" and rr >= 0:
-                cat_widget = self.residentTabs.currentWidget()
-                lst = cat_widget.findChild(QtWidgets.QListWidget, f"list_{rt_name}")
-                if lst and rr < lst.count():
-                    lst.setCurrentRow(rr)
-                    self._on_resident_selected(rt_name, rr)
+            
+            # 再構築時に _detail_ref_uuid を元に選択状態が復元される
+            if self.residentTabs.tabText(self.residentTabs.currentIndex()) == rt_name:
+                pass # _build_category_widget で選択とロードが完了しているため何もしない
 
     def _bring_front(self):
         self.showNormal(); self.raise_(); self.activateWindow()
