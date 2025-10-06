@@ -1,15 +1,5 @@
-# benrinote.py
 # =========================================================
-# 便利ノート（PySide6 / 単一ファイル）
-# - ToDo：タイトル/詳細を分離、完了→アーカイブ、アーカイブ編集/削除（タブ）
-# - 常駐事項：カテゴリ＝タブ、項目追加/改名/削除、D&Dで並べ替え
-# - 左：ToDo/アーカイブ + 常駐（上下スプリッタで可変）
-# - 右：詳細（選択中ToDo/常駐の本文を編集） & フリースペース
-# - 画像：貼付・D&D・挿入はすべて base64 埋め込み（外部参照は保存時にも自動で埋め込み直し）
-# - 背景色変更（各エディタ）
-# - リスト行の区切り線（ToDo/常駐）
-# - 「常に手前」トグル（起動時は必ずOFF）、トレイ常駐、×は常に押せる
-# - ツールバーをダブルクリックで 70% サイズ↔前回サイズ
+# Ver1.7
 # =========================================================
 
 from __future__ import annotations
@@ -20,7 +10,7 @@ from datetime import datetime
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
-APP_TITLE = "便利ノート"
+APP_TITLE = "便利ノート Ver1.7"
 
 # 保存先（Winなら %LOCALAPPDATA%\BenriNote）
 DATA_DIR  = Path(os.getenv("LOCALAPPDATA", str(Path.home()))) / "BenriNote"
@@ -34,18 +24,7 @@ ACCENT, ACCENT_HOVER, ACCENT_WEAK = "#4F8AF3", "#6BA0F6", "#E6E6FF"
 FG, BG, PANEL_BG = "#222222", "#FAFAFB", "#FFFFFF"
 BORDER, HANDLE = "#E6E6EA", "#EAEAEA"
 
-# 【修正1】DEFAULT_STATEに常駐事項のアーカイブを追加
-DEFAULT_STATE: Dict[str, Any] = {
-    # ToDo: items: {id, title, done, html}
-    "todo": {"items": [], "archive": []},  # archive: {id, title, html, archived_at}
-    # 常駐： "カテゴリ名": {"items":[{"id","title","html"}], "archive":[{"id","title","html", "archived_at"}]}
-    "categories": {},
-    "category_order": [],
-    # フリースペース
-    "memo2": {"html": ""},
-}
-
-# ---------- JSON I/O ----------
+# ---------- JSON ----------
 def load_json(path: Path, default: Dict[str, Any]) -> Dict[str, Any]:
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -59,23 +38,7 @@ def save_json(path: Path, data: Dict[str, Any]):
         json.dump(data, f, ensure_ascii=False, indent=2)
     tmp.replace(path)
 
-# ---------- utils ----------
-def plain_to_html(text: str) -> str:
-    import html
-    if text is None: text = ""
-    return f"<p>{html.escape(text).replace('\\n', '<br>')}</p>"
-
-def html_to_plain(html: str) -> str:
-    """QTextEdit.toHtml() から素のテキストを抽出。"""
-    if not html: return ""
-    html = re.sub(r"<style\b[^>]*>.*?</style>", "", html, flags=re.I | re.S)
-    html = re.sub(r"<head\b[^>]*>.*?</head>", "", html, flags=re.I | re.S)
-    html = re.sub(r"<br\s*/?>", "\n", html, flags=re.I)
-    html = re.sub(r"<[^>]+>", "", html)
-    txt = QtGui.QTextDocumentFragment.fromHtml(html).toPlainText()
-    return txt.strip()
-
-# ---------- excepthook ----------
+# ---------- 例外ハンドラ ----------
 def install_excepthook():
     def _hook(t, v, tb):
         try:
@@ -93,27 +56,83 @@ def install_excepthook():
     sys.excepthook = _hook
 
 # =========================================================
-# リスト用：区切り線 delegate
+# ユーティリティ
 # =========================================================
-class SeparatorDelegate(QtWidgets.QStyledItemDelegate):
-    """各行の下に1pxの区切り線を描く。"""
-    def paint(self, painter: QtGui.QPainter, option: QtWidgets.QStyleOptionViewItem, index: QtCore.QModelIndex):
-        super().paint(painter, option, index)
-        painter.save()
-        pen = QtGui.QPen(QtGui.QColor(BORDER))
-        pen.setWidth(1)
-        painter.setPen(pen)
-        y = option.rect.bottom() - 1
-        painter.drawLine(option.rect.left() + 6, y, option.rect.right() - 6, y)
-        painter.restore()
+def plain_to_html(text: str) -> str:
+    import html
+    if text is None: text = ""
+    return f"<p>{html.escape(text).replace('\\n', '<br>')}</p>"
 
-    def sizeHint(self, option: QtWidgets.QStyleOptionViewItem, index: QtCore.QModelIndex):
-        sz = super().sizeHint(option, index)
-        return QtCore.QSize(sz.width(), max(sz.height(), 24))  # ちょい高めに
+def html_to_plain(html: str) -> str:
+    if not html: return ""
+    html = re.sub(r"<style\b[^>]*>.*?</style>", "", html, flags=re.I | re.S)
+    html = re.sub(r"<head\b[^>]*>.*?</head>", "", html, flags=re.I | re.S)
+    html = re.sub(r"<br\s*/?>", "\n", html, flags=re.I)
+    html = re.sub(r"<[^>]+>", "", html)
+    txt = QtGui.QTextDocumentFragment.fromHtml(html).toPlainText()
+    return txt.strip()
 
 # =========================================================
-# 画像：常に base64 埋め込み
+# ToDoモデル（編集・色付き対応版）
 # =========================================================
+class TodoModel(QtCore.QAbstractListModel):
+    def __init__(self, items: List[Dict[str, Any]]):
+        super().__init__(); self.items = items
+
+    def rowCount(self, parent=QtCore.QModelIndex()): 
+        return len(self.items)
+
+    def data(self, index, role):
+        if not index.isValid(): return None
+        it = self.items[index.row()]
+        if role == QtCore.Qt.DisplayRole:
+            return it.get("title","")
+        if role == QtCore.Qt.FontRole and it.get("done"):
+            f = QtGui.QFont(); f.setStrikeOut(True); return f
+        if role == QtCore.Qt.BackgroundRole:
+            col = it.get("color")
+            if col: return QtGui.QBrush(QtGui.QColor(col))
+        return None
+
+    def add(self, text: str, html: str = None):
+        self.beginInsertRows(QtCore.QModelIndex(), len(self.items), len(self.items))
+        self.items.append({
+            "id": str(uuid.uuid4()),
+            "title": text,
+            "done": False,
+            "html": html or "",
+            "color": None,
+        })
+        self.endInsertRows()
+
+    def toggle(self, row: int):
+        if 0 <= row < len(self.items):
+            self.items[row]["done"] = not self.items[row]["done"]
+            self.dataChanged.emit(self.index(row), self.index(row))
+
+    def remove(self, row: int):
+        if 0 <= row < len(self.items):
+            self.beginRemoveRows(QtCore.QModelIndex(), row, row)
+            self.items.pop(row); self.endRemoveRows()
+
+    def flags(self, index):
+        if not index.isValid():
+            return QtCore.Qt.ItemIsEnabled
+        return (QtCore.Qt.ItemIsSelectable | QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsEditable)
+
+    def setData(self, index, value, role):
+        if not index.isValid():
+            return False
+        if role == QtCore.Qt.EditRole:
+            text = str(value).strip()
+            self.items[index.row()]["title"] = text
+            self.dataChanged.emit(index, index)
+            return True
+        return False
+# =========================================================
+# 画像埋め込み / 区切り線 / リッチツールバー / クリックでリンクを開く
+# =========================================================
+
 def _qimage_to_data_url(img: QtGui.QImage, fmt: str = "PNG") -> str:
     buf = QtCore.QBuffer()
     buf.open(QtCore.QIODevice.WriteOnly)
@@ -123,74 +142,58 @@ def _qimage_to_data_url(img: QtGui.QImage, fmt: str = "PNG") -> str:
     return f"data:{mime};base64,{ba}"
 
 def _qimage_to_html_tag(img: QtGui.QImage) -> str:
-    """QImage から Base64 Data URL を含む <img> タグを生成する。"""
-    dataurl = _qimage_to_data_url(img)
-    return f'<img src="{dataurl}" alt="image" />'
-
+    return f'<img src="{_qimage_to_data_url(img)}" alt="image" />'
 
 def inline_external_images(html: str) -> str:
-    """HTML内の <img src=...> で data: 以外をQImage読込→dataURLに差し替える。"""
-    if not html:
-        return html
-
+    if not html: return html
     def replace_tag(m: re.Match) -> str:
-        whole = m.group(0)
-        before = m.group(1)
-        src = m.group(2)
-        after = m.group(3)
-        # すでに data:
-        if src.lower().startswith("data:"):
-            return whole
-
-        # file:/// または C:\... → ローカルファイル扱い
+        whole, before, src, after = m.group(0), m.group(1), m.group(2), m.group(3)
+        if src.lower().startswith("data:"): return whole
         path = None
         if src.lower().startswith("file:///"):
             path = QtCore.QUrl(src).toLocalFile()
         elif re.match(r"^[a-zA-Z]:[\\/]", src):
             path = src
-
         if path and os.path.exists(path):
             qimg = QtGui.QImage(path)
             if not qimg.isNull():
-                dataurl = _qimage_to_data_url(qimg, "PNG")
-                return f"<img{before}src=\"{dataurl}\"{after}>"
+                return f"<img{before}src=\"{_qimage_to_data_url(qimg,'PNG')}\"{after}>"
         return whole
+    return re.sub(r'<img([^>]*?)\bsrc=["\']([^"\']+)["\']([^>]*)>', replace_tag, html, flags=re.I)
 
-    return re.sub(r'<img([^>]*?)\bsrc=["\']([^"\']+)["\']([^>]*)>',
-                  replace_tag, html, flags=re.I)
+class SeparatorDelegate(QtWidgets.QStyledItemDelegate):
+    def paint(self, painter: QtGui.QPainter, option: QtWidgets.QStyleOptionViewItem, index: QtCore.QModelIndex):
+        super().paint(painter, option, index)
+        painter.save()
+        pen = QtGui.QPen(QtGui.QColor(BORDER)); pen.setWidth(1)
+        painter.setPen(pen)
+        y = option.rect.bottom() - 1
+        painter.drawLine(option.rect.left() + 6, y, option.rect.right() - 6, y)
+        painter.restore()
+    def sizeHint(self, option, index):
+        sz = super().sizeHint(option, index)
+        return QtCore.QSize(sz.width(), max(sz.height(), 24))
 
 class EmbedImageTextEdit(QtWidgets.QTextEdit):
-    """貼り付け/ドロップ/HTML貼付の画像を必ず埋め込み(QImage→dataURL)にする。"""
     def canInsertFromMimeData(self, source: QtCore.QMimeData) -> bool:
         return source.hasImage() or source.hasUrls() or source.hasHtml() or source.hasText() or \
                super().canInsertFromMimeData(source)
 
     def insertFromMimeData(self, source: QtCore.QMimeData):
-        # 1) 直接の画像
         if source.hasImage():
             qimg = QtGui.QImage(source.imageData())
             if not qimg.isNull():
-                html_tag = _qimage_to_html_tag(qimg)
-                self.textCursor().insertHtml(html_tag)
-                return
-
-        # 2) URL/ファイル
+                self.textCursor().insertHtml(_qimage_to_html_tag(qimg)); return
         if source.hasUrls():
             handled = False
             for url in source.urls():
                 if url.isLocalFile():
-                    path = url.toLocalFile()
-                    if path.lower().endswith((".png",".jpg",".jpeg",".bmp",".gif",".webp")):
-                        qimg = QtGui.QImage(path)
+                    path = url.toLocalFile().lower()
+                    if path.endswith((".png",".jpg",".jpeg",".bmp",".gif",".webp")):
+                        qimg = QtGui.QImage(url.toLocalFile())
                         if not qimg.isNull():
-                            html_tag = _qimage_to_html_tag(qimg)
-                            self.textCursor().insertHtml(html_tag)
-                            handled = True
-                        continue
-            if handled:
-                return
-
-        # 3) HTML片（<img src="file:///..."> や C:\... → 埋め込み）
+                            self.textCursor().insertHtml(_qimage_to_html_tag(qimg)); handled = True
+            if handled: return
         if source.hasHtml():
             html = source.html()
             def repl(m: re.Match) -> str:
@@ -203,28 +206,55 @@ class EmbedImageTextEdit(QtWidgets.QTextEdit):
                 if path and os.path.exists(path):
                     qimg = QtGui.QImage(path)
                     if not qimg.isNull():
-                        html_tag = _qimage_to_html_tag(qimg)
-                        self.textCursor().insertHtml(html_tag)
-                        return ""  # 元タグは消す
+                        self.textCursor().insertHtml(_qimage_to_html_tag(qimg)); return ""
                 return m.group(0)
-            
             html_wo_imgs = re.sub(r'<img[^>]*\bsrc=["\']([^"\']+)["\'][^>]*>', repl, html, flags=re.I)
-            self.insertHtml(html_wo_imgs)
-            return
-
-        # 4) それ以外は通常処理
+            self.insertHtml(html_wo_imgs); return
         super().insertFromMimeData(source)
 
-# =========================================================
-# リッチツールバー
-# =========================================================
+    # ▼ リンク挿入（青下線）＆クリックで開く
+    def insert_link(self, href: Optional[str] = None, text: Optional[str] = None):
+        if href is None:
+            menu = QtWidgets.QMenu(self)
+            act_url = menu.addAction("URLを入力して挿入")
+            act_file = menu.addAction("ファイルを選んで挿入")
+            picked = menu.exec(QtGui.QCursor.pos())
+            if not picked: return
+            if picked is act_url:
+                href, ok = QtWidgets.QInputDialog.getText(self, "リンクのURL", "URL（http(s):// / file:/// / C:\\...）：")
+                if not ok or not href.strip(): return
+                href = href.strip()
+            else:
+                path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "リンクするファイルを選択", "", "すべてのファイル (*.*)")
+                if not path: return
+                href = QtCore.QUrl.fromLocalFile(path).toString()
+
+        if text is None or not text.strip():
+            text, ok = QtWidgets.QInputDialog.getText(self, "リンクの表示文字", "表示文字：", text=href)
+            if not ok: return
+            text = text.strip() or href
+
+        html = f'<a href="{href}"><span style="color:#1155cc;text-decoration:underline;">{text}</span></a>'
+        self.textCursor().insertHtml(html)
+
+    def mouseReleaseEvent(self, e: QtGui.QMouseEvent):
+        anchor = self.anchorAt(e.pos())
+        if anchor:
+            if re.match(r"^[a-zA-Z]:[\\/]", anchor):
+                url = QtCore.QUrl.fromLocalFile(anchor)
+            else:
+                url = QtCore.QUrl(anchor)
+                if not url.scheme():
+                    url = QtCore.QUrl.fromLocalFile(anchor)
+            QtGui.QDesktopServices.openUrl(url); e.accept(); return
+        super().mouseReleaseEvent(e)
+
 def make_icon_A_underline(size=18) -> QtGui.QIcon:
     pm = QtGui.QPixmap(size, size); pm.fill(QtCore.Qt.GlobalColor.transparent)
     p = QtGui.QPainter(pm); p.setRenderHint(QtGui.QPainter.Antialiasing, True)
     font = QtGui.QFont("Segoe UI"); font.setBold(True); font.setPointSizeF(size * 0.65)
     p.setFont(font); p.setPen(QtGui.QPen(QtGui.QColor(FG), 1))
-    rect = QtCore.QRectF(0, -2, size, size)
-    p.drawText(rect, QtCore.Qt.AlignHCenter | QtCore.Qt.AlignVCenter, "A")
+    rect = QtCore.QRectF(0, -2, size, size); p.drawText(rect, QtCore.Qt.AlignHCenter | QtCore.Qt.AlignVCenter, "A")
     p.setPen(QtGui.QPen(QtGui.QColor(FG), 2, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap))
     y = int(size * 0.82); p.drawLine(int(size*0.18), y, int(size*0.82), y)
     p.end(); return QtGui.QIcon(pm)
@@ -232,13 +262,11 @@ def make_icon_A_underline(size=18) -> QtGui.QIcon:
 def make_icon_palette(color: QtGui.QColor, size=18) -> QtGui.QIcon:
     pm = QtGui.QPixmap(size, size); pm.fill(QtCore.Qt.GlobalColor.transparent)
     p = QtGui.QPainter(pm); p.setRenderHint(QtGui.QPainter.Antialiasing, True)
-    path = QtGui.QPainterPath()
-    r = size - 2
+    path = QtGui.QPainterPath(); r = size - 2
     path.addRoundedRect(QtCore.QRectF(1, 2, r, r-2), size*0.3, size*0.3)
     hole = QtGui.QPainterPath(); hole.addEllipse(QtCore.QRectF(size*0.45, size*0.55, size*0.28, size*0.28))
     shape = path.subtracted(hole)
-    p.fillPath(shape, QtGui.QBrush(QtGui.QColor(245,245,245)))
-    p.setPen(QtGui.QPen(QtGui.QColor(FG), 1)); p.drawPath(shape)
+    p.fillPath(shape, QtGui.QBrush(QtGui.QColor(245,245,245))); p.setPen(QtGui.QPen(QtGui.QColor(FG), 1)); p.drawPath(shape)
     p.setBrush(QtGui.QBrush(color)); p.setPen(QtGui.QPen(QtGui.QColor(FG), 1))
     p.drawEllipse(QtCore.QRectF(size*0.18, size*0.22, size*0.28, size*0.28))
     p.end(); return QtGui.QIcon(pm)
@@ -257,6 +285,8 @@ def make_icon_picture(size=18) -> QtGui.QIcon:
 
 class RichBar(QtWidgets.QToolBar):
     htmlChanged = QtCore.Signal()
+    bgColorChanged = QtCore.Signal(QtGui.QColor)  # 背景色変更を通知（永続化用）
+
     def __init__(self, target: QtWidgets.QTextEdit, parent=None):
         super().__init__(parent)
         self.target = target
@@ -283,6 +313,12 @@ class RichBar(QtWidgets.QToolBar):
         self.actInsertImg = QtGui.QAction(make_icon_picture(), "画像挿入（ファイル）", self)
         self.actInsertImg.triggered.connect(self.insert_image_from_file); self.addAction(self.actInsertImg)
 
+        self.addSeparator()
+        self.actInsertLink = QtGui.QAction("リンク挿入", self)
+        self.actInsertLink.setToolTip("URLやファイルへのリンクを挿入")
+        self.actInsertLink.triggered.connect(self._insert_link)
+        self.addAction(self.actInsertLink)
+
     def toggle_underline(self, on: bool):
         fmt = QtGui.QTextCharFormat(); fmt.setFontUnderline(on); self._merge(fmt)
 
@@ -305,15 +341,14 @@ class RichBar(QtWidgets.QToolBar):
         self.target.setStyleSheet(
             f"QTextEdit{{background:{col.name()}; padding:6px; border:1px solid {BORDER}; border-radius:8px;}}"
         )
+        self.bgColorChanged.emit(col)
 
     def paste_image_from_clipboard(self):
         cb = QtWidgets.QApplication.clipboard()
         if img := cb.image():
             qimg = QtGui.QImage(img)
             if not qimg.isNull():
-                html_tag = _qimage_to_html_tag(qimg)
-                self.target.textCursor().insertHtml(html_tag)
-                self.htmlChanged.emit()
+                self.target.textCursor().insertHtml(_qimage_to_html_tag(qimg)); self.htmlChanged.emit()
         else:
             QtWidgets.QMessageBox.information(self, "情報", "クリップボードに画像がありません。")
 
@@ -323,71 +358,49 @@ class RichBar(QtWidgets.QToolBar):
         qimg = QtGui.QImage(path)
         if qimg.isNull():
             QtWidgets.QMessageBox.warning(self, "失敗", "画像を読み込めませんでした。"); return
-        html_tag = _qimage_to_html_tag(qimg)
-        self.target.textCursor().insertHtml(html_tag)
-        self.htmlChanged.emit()
+        self.target.textCursor().insertHtml(_qimage_to_html_tag(qimg)); self.htmlChanged.emit()
 
     def resize_selected_image(self):
-        """カーソル位置の画像（または直前の画像）の幅をpx指定で変更"""
         cur = self.target.textCursor()
         fmt = cur.charFormat()
-
-        # 画像直後にカーソルがあるケース：直前の1文字をチェック
         if not fmt.isImageFormat():
             cur2 = QtGui.QTextCursor(cur)
             if cur2.position() > 0:
                 cur2.movePosition(QtGui.QTextCursor.Left, QtGui.QTextCursor.MoveAnchor, 1)
                 fmt2 = cur2.charFormat()
                 if fmt2.isImageFormat():
-                    cur = cur2
-                    fmt = fmt2
-
+                    cur = cur2; fmt = fmt2
         if not fmt.isImageFormat():
             QtWidgets.QMessageBox.information(self, "情報", "サイズ変更したい画像の上（または直後）にカーソルを置いてください。")
             return
-
         imgf: QtGui.QTextImageFormat = fmt.toImageFormat()
-        current_w = int(imgf.width()) if imgf.width() > 0 else 400  # 幅未設定なら暫定400px
+        current_w = int(imgf.width()) if imgf.width() > 0 else 400
         new_w, ok = QtWidgets.QInputDialog.getInt(self, "画像の幅", "幅 (px)：", current_w, 48, 4000, 1)
-        if not ok:
-            return
-
-        imgf.setWidth(float(new_w))  # 高さはアスペクト比に従って自動
+        if not ok: return
+        imgf.setWidth(float(new_w))
         cur.mergeCharFormat(imgf)
         self.htmlChanged.emit()
 
-# ---------- ToDo Model ----------
-class TodoModel(QtCore.QAbstractListModel):
-    def __init__(self, items: List[Dict[str, Any]]):
-        super().__init__(); self.items = items
-    def rowCount(self, parent=QtCore.QModelIndex()): return len(self.items)
-    def data(self, index, role):
-        if not index.isValid(): return None
-        it = self.items[index.row()]
-        if role == QtCore.Qt.DisplayRole:
-            return ("[✓] " if it.get("done") else "[ ] ") + it.get("title","")
-        if role == QtCore.Qt.FontRole and it.get("done"):
-            f = QtGui.QFont(); f.setStrikeOut(True); return f
-        return None
-    def add(self, text: str, html: str = None):
-        self.beginInsertRows(QtCore.QModelIndex(), len(self.items), len(self.items))
-        self.items.append({
-            "id": str(uuid.uuid4()),
-            "title": text,
-            "done": False,
-            "html": html or ""
-        })
-        self.endInsertRows()
-    def toggle(self, row: int):
-        if 0 <= row < len(self.items):
-            self.items[row]["done"] = not self.items[row]["done"]
-            self.dataChanged.emit(self.index(row), self.index(row))
-    def remove(self, row: int):
-        if 0 <= row < len(self.items):
-            self.beginRemoveRows(QtCore.QModelIndex(), row, row)
-            self.items.pop(row); self.endRemoveRows()
+    def _insert_link(self):
+        if hasattr(self.target, "insert_link"): self.target.insert_link()
+        else:
+            href, ok = QtWidgets.QInputDialog.getText(self, "リンクのURL", "URL：")
+            if not ok or not href.strip(): return
+            text, ok = QtWidgets.QInputDialog.getText(self, "リンクの表示文字", "表示文字：", text=href)
+            if not ok: return
+            html = f'<a href="{href}"><span style="color:#1155cc;text-decoration:underline;">{text}</span></a>'
+            self.target.textCursor().insertHtml(html)
 
-# ---------- Main Window ----------
+# =========================================================
+# MainWindow（前半：UI構築）
+# =========================================================
+DEFAULT_STATE: Dict[str, Any] = {
+    "todo": {"items": [], "archive": []},
+    "categories": {},
+    "category_order": [],
+    "memo2": {"html": ""},
+}
+
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
@@ -396,42 +409,26 @@ class MainWindow(QtWidgets.QMainWindow):
         self.prev_geometry: Optional[QtCore.QRect] = None
 
         self.state = load_json(DATA_FILE, DEFAULT_STATE)
-
-        # ToDo: text→title への移行（古いデータ保護）
-        changed = False
-        for it in self.state["todo"]["items"]:
-            if "title" not in it:
-                it["title"] = it.get("text", ""); changed = True
-        for it in self.state["todo"]["archive"]:
-            if "title" not in it:
-                it["title"] = it.get("text", ""); changed = True
-        
-        # 【修正2】常駐事項のデータ構造の確認と初期化
-        for name, cat_data in list(self.state["categories"].items()):
-            if "archive" not in cat_data:
-                cat_data["archive"] = []
-                changed = True
-
-        if changed:
-            save_json(DATA_FILE, self.state)
-
-        self._migrate_categories_to_items()
         self.conf  = load_json(CONF_FILE, {"geometry": None})
 
-        # ★ 詳細参照（どのアイテムを編集しているか）
-        self._detail_ref: Optional[Tuple] = None
+        # 旧データのtitle移行 & 常駐構造の整備
+        changed = False
+        for it in self.state["todo"]["items"]:
+            if "title" not in it: it["title"] = it.get("text",""); changed = True
+        for it in self.state["todo"]["archive"]:
+            if "title" not in it: it["title"] = it.get("text",""); changed = True
+        for name, cat in list(self.state["categories"].items()):
+            cat.setdefault("items", []); cat.setdefault("archive", [])
+        if changed: save_json(DATA_FILE, self.state)
 
         self._apply_global_style()
 
-        # ===== Top toolbar =====
+        # ===== Top Toolbar =====
         self.topBar = QtWidgets.QToolBar()
-        self.topBar.setMovable(False)
-        self.topBar.setIconSize(QtCore.QSize(18,18))
+        self.topBar.setMovable(False); self.topBar.setIconSize(QtCore.QSize(18,18))
         self.topBar.setStyleSheet(f"""
             QToolBar{{padding:6px; border:0; background: {BG};}}
-            QToolButton{{
-                padding:6px 12px; border:1px solid {BORDER}; border-radius:8px; background:{PANEL_BG};
-            }}
+            QToolButton{{padding:6px 12px; border:1px solid {BORDER}; border-radius:8px; background:{PANEL_BG};}}
             QToolButton:checked{{background:{ACCENT_WEAK}; border-color:{ACCENT}; color:{FG};}}
             QToolButton:hover{{border-color:{ACCENT_HOVER};}}
         """)
@@ -440,17 +437,25 @@ class MainWindow(QtWidgets.QMainWindow):
         self.actOnTop = QtGui.QAction("常に手前に表示", self, checkable=True, checked=False)
         self.actOnTop.toggled.connect(self._toggle_always_on_top)
         btnOnTop = QtWidgets.QToolButton(); btnOnTop.setDefaultAction(self.actOnTop); btnOnTop.setCheckable(True)
-        self.topBar.addWidget(btnOnTop)
-        self.topBar.installEventFilter(self)
+        self.topBar.addWidget(btnOnTop); self.topBar.installEventFilter(self)
 
         # ===== 右：詳細 & フリースペース =====
+        # 詳細欄
         self.detailEditor = EmbedImageTextEdit()
         self.detailEditor.setStyleSheet(f"QTextEdit{{background:{PANEL_BG}; padding:6px; border:1px solid {BORDER}; border-radius:8px;}}")
         self.detailBar = RichBar(self.detailEditor)
-        self.detailLabel = QtWidgets.QLabel("詳細"); self.detailLabel.setStyleSheet("font-weight:bold; color:%s;" % FG)
-        # 画像サイズ変更（詳細）
+        self.detailLabel = QtWidgets.QLabel("詳細"); self.detailLabel.setStyleSheet(f"font-weight:bold; color:{FG};")
         btnResizeImgDetail = QtWidgets.QPushButton("画像サイズ変更")
         btnResizeImgDetail.clicked.connect(self.detailBar.resize_selected_image)
+
+        # ▼ 詳細欄の背景色 永続化（CONF_FILE: editor_bg.detail）
+        bg_conf = self.conf.get("editor_bg", {})
+        detail_bg = bg_conf.get("detail")
+        if detail_bg:
+            self.detailEditor.setStyleSheet(
+                f"QTextEdit{{background:{detail_bg}; padding:6px; border:1px solid {BORDER}; border-radius:8px;}}"
+            )
+        self.detailBar.bgColorChanged.connect(lambda col: self._save_editor_bg("detail", col))
 
         self._detailTimer = QtCore.QTimer(self); self._detailTimer.setSingleShot(True); self._detailTimer.setInterval(400)
         self.detailEditor.textChanged.connect(lambda: self._detailTimer.start())
@@ -458,33 +463,37 @@ class MainWindow(QtWidgets.QMainWindow):
 
         detailPane = QtWidgets.QWidget(); v1 = QtWidgets.QVBoxLayout(detailPane)
         v1.setContentsMargins(10,10,5,10); v1.setSpacing(6)
-        v1.addWidget(self.detailLabel)
-        v1.addWidget(self.detailBar)
+        v1.addWidget(self.detailLabel); v1.addWidget(self.detailBar)
         v1.addWidget(btnResizeImgDetail, alignment=QtCore.Qt.AlignLeft)
         v1.addWidget(self.detailEditor, 1)
 
+        # フリースペース
         self.memoFree = EmbedImageTextEdit()
         self.memoFree.setHtml(self.state["memo2"]["html"])
         self.memoFree.textChanged.connect(self._on_free_html_changed)
         self.memoFree.setStyleSheet(f"QTextEdit{{background:{PANEL_BG}; padding:6px; border:1px solid {BORDER}; border-radius:8px;}}")
         self.memoFreeBar = RichBar(self.memoFree)
-        labFree = QtWidgets.QLabel("フリースペース"); labFree.setStyleSheet("font-weight:bold; color:%s;" % FG)
-        # 画像サイズ変更（フリースペース）
-        btnResizeImgFree = QtWidgets.QPushButton("画像サイズ変更")
-        btnResizeImgFree.clicked.connect(self.memoFreeBar.resize_selected_image)
+        labFree = QtWidgets.QLabel("フリースペース"); labFree.setStyleSheet(f"font-weight:bold; color:{FG};")
+        btnResizeImgFree = QtWidgets.QPushButton("画像サイズ変更"); btnResizeImgFree.clicked.connect(self.memoFreeBar.resize_selected_image)
+
+        # ▼ メモ欄の背景色 永続化（CONF_FILE: editor_bg.memo2）
+        memo_bg = bg_conf.get("memo2")
+        if memo_bg:
+            self.memoFree.setStyleSheet(
+                f"QTextEdit{{background:{memo_bg}; padding:6px; border:1px solid {BORDER}; border-radius:8px;}}"
+            )
+        self.memoFreeBar.bgColorChanged.connect(lambda col: self._save_editor_bg("memo2", col))
 
         freePane = QtWidgets.QWidget(); v2 = QtWidgets.QVBoxLayout(freePane)
         v2.setContentsMargins(5,10,10,10); v2.setSpacing(6)
-        v2.addWidget(labFree)
-        v2.addWidget(self.memoFreeBar)
+        v2.addWidget(labFree); v2.addWidget(self.memoFreeBar)
         v2.addWidget(btnResizeImgFree, alignment=QtCore.Qt.AlignLeft)
         v2.addWidget(self.memoFree, 1)
 
         rightSplitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
         rightSplitter.addWidget(detailPane); rightSplitter.addWidget(freePane)
         rightSplitter.setStretchFactor(0, 1); rightSplitter.setStretchFactor(1, 1)
-        rightSplitter.setChildrenCollapsible(False)
-        rightSplitter.setHandleWidth(10)
+        rightSplitter.setChildrenCollapsible(False); rightSplitter.setHandleWidth(10)
         rightSplitter.setStyleSheet(f"""
             QSplitter::handle {{
                 background: {HANDLE};
@@ -500,7 +509,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.todoModel = TodoModel(self.state["todo"]["items"])
         self.todoList  = QtWidgets.QListView(); self.todoList.setModel(self.todoModel)
         self.todoList.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
-        self.todoList.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.todoList.setEditTriggers(QtWidgets.QAbstractItemView.DoubleClicked | QtWidgets.QAbstractItemView.EditKeyPressed)
         self.todoList.setItemDelegate(SeparatorDelegate(self.todoList))
         self.todoList.selectionModel().currentChanged.connect(self._on_todo_selected)
         self.todoList.clicked.connect(lambda idx: self._load_detail(("todo", idx.row())))
@@ -512,22 +521,28 @@ class MainWindow(QtWidgets.QMainWindow):
         btnDel = QtWidgets.QPushButton("選択削除")
         btnArc = QtWidgets.QPushButton("完了→アーカイブ")
         btnRen = QtWidgets.QPushButton("タイトル変更")
+        btnColor = QtWidgets.QPushButton("色")
+
         btnTgl.clicked.connect(self._toggle_selected_todo)
         btnDel.clicked.connect(self._del_selected_todo)
         btnArc.clicked.connect(self._archive_done)
-        btnRen.clicked.connect(self._rename_selected_todo)
+        btnRen.clicked.connect(self._rename_selected_todo)   # ← ボタン版も有効
+        btnColor.clicked.connect(self._pick_color_for_selected_todo)
 
         todoPane = QtWidgets.QWidget(); vct = QtWidgets.QVBoxLayout(todoPane)
         vct.setContentsMargins(8,8,8,8)
         vct.addWidget(self.todoList); vct.addWidget(self.todoInput)
         hb2 = QtWidgets.QHBoxLayout()
-        hb2.addWidget(btnTgl); hb2.addWidget(btnArc); hb2.addWidget(btnRen); hb2.addWidget(btnDel)
+        hb2.addWidget(btnTgl); hb2.addWidget(btnArc); hb2.addWidget(btnRen)
+        hb2.addWidget(btnDel); hb2.addWidget(btnColor)
         vct.addLayout(hb2)
 
-        # Archive (ToDo)
         self.archiveList = QtWidgets.QListWidget(); self._refresh_todo_archive_list()
         self.archiveList.setItemDelegate(SeparatorDelegate(self.archiveList))
         self.archiveList.itemDoubleClicked.connect(self._edit_archive_item)
+        self.archiveList.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        self.archiveList.customContextMenuRequested.connect(self._show_archive_context_menu)
+
         btnArcDel = QtWidgets.QPushButton("選択アーカイブ削除")
         btnArcDel.clicked.connect(self._delete_selected_todo_archive)
         arcPane = QtWidgets.QWidget(); varc = QtWidgets.QVBoxLayout(arcPane)
@@ -538,7 +553,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.centerTabs.addTab(todoPane, "ToDo")
         self.centerTabs.addTab(arcPane, "ToDoアーカイブ")
 
-        # ===== 左：常駐カテゴリ =====
+        # ===== 左：常駐カテゴリ（タブ） =====
         self.residentTabs = QtWidgets.QTabWidget()
         self.residentTabs.setTabsClosable(False)
         self.residentTabs.tabBar().setMovable(True)
@@ -550,7 +565,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         leftBottom = QtWidgets.QWidget()
         vlb = QtWidgets.QVBoxLayout(leftBottom); vlb.setContentsMargins(8,0,8,8)
-        titleCat = QtWidgets.QLabel("常駐事項"); titleCat.setStyleSheet("font-weight: bold; color: %s;" % FG)
+        titleCat = QtWidgets.QLabel("常駐事項"); titleCat.setStyleSheet(f"font-weight: bold; color: {FG};")
         toolRow = QtWidgets.QHBoxLayout(); toolRow.addWidget(titleCat); toolRow.addStretch(1)
         toolRow.addWidget(btnAddCat); toolRow.addWidget(btnRenCat); toolRow.addWidget(btnDelCat)
         vlb.addLayout(toolRow); vlb.addWidget(self.residentTabs)
@@ -559,8 +574,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # ===== 左の上下スプリッタ =====
         leftSplit = QtWidgets.QSplitter(QtCore.Qt.Vertical)
-        leftSplit.addWidget(self.centerTabs)
-        leftSplit.addWidget(leftBottom)
+        leftSplit.addWidget(self.centerTabs); leftSplit.addWidget(leftBottom)
         leftSplit.setStretchFactor(0, 3); leftSplit.setStretchFactor(1, 7)
         leftSplit.setHandleWidth(10)
         leftSplit.setStyleSheet(f"QSplitter::handle{{background:{HANDLE}; border:1px solid {BORDER};}}")
@@ -583,7 +597,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._force_standard_window_buttons()
         self._apply_on_top(False, first_time=True)
 
+        # ウィンドウ復元
         self._restore_geometry()
+
+        # トレイ
         self._setup_tray()
 
         # 定期保存
@@ -596,14 +613,25 @@ class MainWindow(QtWidgets.QMainWindow):
             self.todoList.setCurrentIndex(self.todoModel.index(0))
             self._load_detail(("todo", 0))
 
-    # ====== 常駐カテゴリ：データ移行 ======
+        # ▼ 最終状態の保存トリガ
+        self.centerTabs.currentChanged.connect(self._save_last_state)
+        self.todoList.selectionModel().currentChanged.connect(lambda *_: self._save_last_state())
+        self.residentTabs.currentChanged.connect(lambda *_: self._save_last_state())
+
+        # ▼ 起動時に前回ページ復元
+        self._restore_last_state()
+        # ===== 初期表示を調整 =====
+        # 必要に応じて70%サイズトグルなどはダブルクリックで
+        # （イベントフィルタは既に topBar に設定済み）
+
+    # ====== 常駐カテゴリ：データ移行（後方互換） ======
     def _migrate_categories_to_items(self):
         changed = False
         cats = self.state.get("categories", {})
         for name, val in list(cats.items()):
             if isinstance(val, dict) and "items" not in val:
                 html = val.get("html", "")
-                cats[name] = {"items": [], "archive": []} # archive初期化
+                cats[name] = {"items": [], "archive": []}
                 if html:
                     cats[name]["items"].append({"id": str(uuid.uuid4()), "title": "メモ", "html": html})
                 changed = True
@@ -613,48 +641,44 @@ class MainWindow(QtWidgets.QMainWindow):
                     it.setdefault("id", str(uuid.uuid4()))
                     it.setdefault("title", "無題")
                     it.setdefault("html", "")
-                cats[name].setdefault("archive", []) # archiveがなければ初期化
+                cats[name].setdefault("archive", [])
         if changed:
             save_json(DATA_FILE, self.state)
 
     # ====== 常駐カテゴリ UI ======
     def _rebuild_resident_tabs(self):
         self.residentTabs.blockSignals(True)
-        current_text = self.residentTabs.tabText(self.residentTabs.currentIndex()) # 現在のタブ名保存
-        
+        current_text = self.residentTabs.tabText(self.residentTabs.currentIndex()) if self.residentTabs.count() else None
+
         self.residentTabs.clear()
         order = list(self.state.get("category_order", []))
         for k in self.state["categories"].keys():
             if k not in order: order.append(k)
         self.state["category_order"] = order
-        
+
         new_index = 0
         for name in order:
             self.residentTabs.addTab(self._build_category_widget(name), name)
             if name == current_text:
                 new_index = self.residentTabs.count() - 1
-        
-        # 最後にアーカイブタブを追加
+
         if order:
             self.residentTabs.addTab(self._build_resident_archive_widget(), "アーカイブ")
-        
+
         self.residentTabs.tabBar().tabMoved.connect(self._on_resident_tab_moved)
-        
-        # 選択状態を復元 (アーカイブタブの可能性も考慮)
+
         if current_text == "アーカイブ":
-             self.residentTabs.setCurrentIndex(self.residentTabs.count() - 1)
+            self.residentTabs.setCurrentIndex(self.residentTabs.count() - 1)
         elif new_index < self.residentTabs.count():
-             self.residentTabs.setCurrentIndex(new_index)
-        
+            self.residentTabs.setCurrentIndex(new_index)
         self.residentTabs.blockSignals(False)
 
-    # 【追加】常駐項目リストの表示ウィジェット
     def _build_category_widget(self, cat_name: str) -> QtWidgets.QWidget:
         wrap = QtWidgets.QWidget()
         v = QtWidgets.QVBoxLayout(wrap); v.setContentsMargins(6,6,6,6); v.setSpacing(6)
 
         lst = QtWidgets.QListWidget(objectName=f"list_{cat_name}")
-        lst.setStyleSheet("QListWidget{background:%s; border:1px solid %s; border-radius:8px;}" % (PANEL_BG, BORDER))
+        lst.setStyleSheet(f"QListWidget{{background:{PANEL_BG}; border:1px solid {BORDER}; border-radius:8px;}}")
         lst.setDragDropMode(QtWidgets.QAbstractItemView.InternalMove)
         lst.setDefaultDropAction(QtCore.Qt.MoveAction)
         lst.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
@@ -670,52 +694,46 @@ class MainWindow(QtWidgets.QMainWindow):
         hb = QtWidgets.QHBoxLayout()
         btnAdd = QtWidgets.QPushButton("項目追加")
         btnRen = QtWidgets.QPushButton("項目名変更")
-        # 【修正3】項目アーカイブボタンを追加
         btnArcItem = QtWidgets.QPushButton("項目アーカイブ")
         btnDel = QtWidgets.QPushButton("項目削除")
-        
         hb.addWidget(btnAdd); hb.addWidget(btnRen); hb.addWidget(btnArcItem); hb.addWidget(btnDel); hb.addStretch(1)
 
         btnAdd.clicked.connect(lambda _=None, cn=cat_name, w=lst: self._add_resident_item(cn, w))
         btnRen.clicked.connect(lambda _=None, cn=cat_name, w=lst: self._rename_resident_item(cn, w))
-        # 【修正3】項目アーカイブボタンの接続
         btnArcItem.clicked.connect(lambda _=None, cn=cat_name, w=lst: self._archive_resident_item(cn, w))
         btnDel.clicked.connect(lambda _=None, cn=cat_name, w=lst: self._delete_resident_item(cn, w))
 
         v.addWidget(lst, 1); v.addLayout(hb)
 
-        # 初期選択（1件でも確実に詳細が出る）
         if lst.count() > 0:
             lst.setCurrentRow(0)
             self._on_resident_selected(cat_name, 0)
 
         return wrap
 
-    # 【追加】常駐アーカイブリストの表示ウィジェット
     def _build_resident_archive_widget(self) -> QtWidgets.QWidget:
         wrap = QtWidgets.QWidget()
         v = QtWidgets.QVBoxLayout(wrap); v.setContentsMargins(8,8,8,8)
 
-        # アーカイブ項目を表示するリストウィジェット
         self.residentArchiveList = QtWidgets.QListWidget(objectName="list_resident_archive")
-        self.residentArchiveList.setStyleSheet("QListWidget{background:%s; border:1px solid %s; border-radius:8px;}" % (PANEL_BG, BORDER))
+        self.residentArchiveList.setStyleSheet(f"QListWidget{{background:{PANEL_BG}; border:1px solid {BORDER}; border-radius:8px;}}")
         self.residentArchiveList.setItemDelegate(SeparatorDelegate(self.residentArchiveList))
-        self.residentArchiveList.itemDoubleClicked.connect(self._edit_resident_archive_item) # 編集機能
-        
+        self.residentArchiveList.itemDoubleClicked.connect(self._edit_resident_archive_item)
+
         self._refresh_resident_archive_list()
 
         hb = QtWidgets.QHBoxLayout()
         btnRestore = QtWidgets.QPushButton("選択復元（元カテゴリへ）")
         btnDel = QtWidgets.QPushButton("選択削除")
         hb.addWidget(btnRestore); hb.addWidget(btnDel)
-        
+
         btnRestore.clicked.connect(self._restore_resident_archive_item)
         btnDel.clicked.connect(self._delete_resident_archive_item)
 
         v.addWidget(self.residentArchiveList, 1); v.addLayout(hb)
         return wrap
-    
-    # --- 項目操作 ---
+
+    # --- 常駐：項目操作 ---
     def _add_resident_item(self, cat_name: str, list_widget: QtWidgets.QListWidget):
         title, ok = QtWidgets.QInputDialog.getText(self, "項目の追加", "項目名：")
         if not ok or not title.strip(): return
@@ -727,6 +745,7 @@ class MainWindow(QtWidgets.QMainWindow):
         list_widget.setCurrentRow(row)
         self._on_resident_selected(cat_name, row)
         self._save_all()
+        self._save_last_state()
 
     def _rename_resident_item(self, cat_name: str, list_widget: QtWidgets.QListWidget):
         row = list_widget.currentRow()
@@ -741,27 +760,20 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._detail_ref and self._detail_ref[0] == "resident" and self._detail_ref[1] == cat_name and self._detail_ref[2] == row:
             self.detailLabel.setText(f"詳細（{cat_name} / {new}）")
         self._save_all()
+        self._save_last_state()
 
-    # 【追加】常駐事項の項目をアーカイブする
     def _archive_resident_item(self, cat_name: str, list_widget: QtWidgets.QListWidget):
         row = list_widget.currentRow()
         if row < 0: return
-        
-        # 項目をリストから削除し、データから取得
         item_to_archive = self.state["categories"][cat_name]["items"].pop(row)
         list_widget.takeItem(row)
-        
-        # アーカイブ用のデータを作成し、アーカイブリストに追加
         item_to_archive["archived_at"] = int(time.time())
-        item_to_archive["original_category"] = cat_name # 復元のためカテゴリ名を保存
+        item_to_archive["original_category"] = cat_name
         self.state["categories"][cat_name]["archive"].append(item_to_archive)
-        
-        # UIを更新
         if list_widget.currentRow() < 0:
             self._load_detail(None)
         self._refresh_resident_archive_list()
         self._save_all()
-        # アーカイブタブに切り替え
         for i in range(self.residentTabs.count()):
             if self.residentTabs.tabText(i) == "アーカイブ":
                 self.residentTabs.setCurrentIndex(i); break
@@ -777,53 +789,44 @@ class MainWindow(QtWidgets.QMainWindow):
         if list_widget.currentRow() < 0:
             self._load_detail(None)
         self._save_all()
+        self._save_last_state()
 
     def _on_resident_item_rows_moved(self, cat_name: str, list_widget: QtWidgets.QListWidget):
         items = self.state["categories"][cat_name]["items"]
         new_titles = [list_widget.item(i).text() for i in range(list_widget.count())]
         title_to_list: Dict[str, List[Dict[str, Any]]] = {}
         for it in items:
-            # Note: タイトル重複時は最初の要素を採用する簡易ロジック
             title_to_list.setdefault(it["title"], []).append(it)
         new_items: List[Dict[str, Any]] = []
         for t in new_titles:
-            # ここで .pop(0) するときにキーエラーを防ぐためにチェック
             if t in title_to_list and title_to_list[t]:
-                 new_items.append(title_to_list[t].pop(0))
-        
-        # 元のリストと長さが合わない場合はエラーの可能性があるため、ログを出すか、より堅牢なロジックが必要だが、
-        # UUIDがあるため、ここでは簡易的に新リストに置き換える
+                new_items.append(title_to_list[t].pop(0))
         self.state["categories"][cat_name]["items"] = new_items
         self._save_all()
+        self._save_last_state()
 
-    # --- 常駐アーカイブ操作 ---
+    # --- 常駐アーカイブ ---
     def _refresh_resident_archive_list(self):
         if not hasattr(self, 'residentArchiveList'): return
         self.residentArchiveList.clear()
-        
         all_archives = []
         for cat_data in self.state["categories"].values():
             for item in cat_data.get("archive", []):
                 all_archives.append(item)
-                
-        # アーカイブ日時の降順でソート
         sorted_arc = sorted(all_archives, key=lambda x: x.get("archived_at", 0), reverse=True)
-
         for it in sorted_arc:
             ts = QtCore.QDateTime.fromSecsSinceEpoch(it.get("archived_at", 0)).toString("yyyy-MM-dd HH:mm")
             title = it.get('title','')
             orig_cat = it.get('original_category', '不明')
             list_item = QtWidgets.QListWidgetItem(f"[{orig_cat}] {ts} - {title}")
-            list_item.setData(QtCore.Qt.UserRole, it["id"]) # IDをUserDataとして保持
+            list_item.setData(QtCore.Qt.UserRole, it["id"])
             self.residentArchiveList.addItem(list_item)
-            
+
     def _get_resident_archive_item(self, row: int) -> Optional[Dict[str, Any]]:
         if not hasattr(self, 'residentArchiveList') or row < 0: return None
         item = self.residentArchiveList.item(row)
         if not item: return None
         item_id = item.data(QtCore.Qt.UserRole)
-        
-        # IDを使って実際のデータを探す
         for cat_data in self.state["categories"].values():
             for archive_item in cat_data.get("archive", []):
                 if archive_item["id"] == item_id:
@@ -834,96 +837,57 @@ class MainWindow(QtWidgets.QMainWindow):
         row = self.residentArchiveList.currentRow()
         archive_item = self._get_resident_archive_item(row)
         if not archive_item: return
-
         orig_cat = archive_item.get("original_category")
         if not orig_cat or orig_cat not in self.state["categories"]:
-            QtWidgets.QMessageBox.warning(self, "エラー", "復元先のカテゴリが見つかりません。")
-            return
-            
+            QtWidgets.QMessageBox.warning(self, "エラー", "復元先のカテゴリが見つかりません。"); return
         if QtWidgets.QMessageBox.question(self, "復元確認", f"「{archive_item['title']}」をカテゴリ「{orig_cat}」に復元しますか？") != QtWidgets.QMessageBox.Yes:
             return
-        
-        # 1. アーカイブリストから削除
-        self.state["categories"][orig_cat]["archive"] = [
-            it for it in self.state["categories"][orig_cat]["archive"] if it["id"] != archive_item["id"]
-        ]
-        
-        # 2. 項目リストに復元（archived_atとoriginal_categoryを削除）
+        self.state["categories"][orig_cat]["archive"] = [it for it in self.state["categories"][orig_cat]["archive"] if it["id"] != archive_item["id"]]
         restored_item = {k: v for k, v in archive_item.items() if k not in ["archived_at", "original_category"]}
         self.state["categories"][orig_cat]["items"].append(restored_item)
-
-        # 3. UIの更新
-        self._rebuild_resident_tabs() # タブを再構築してリストを更新
-        self._refresh_resident_archive_list()
-        self._save_all()
-        
-        # 復元したカテゴリのタブに切り替える
+        self._rebuild_resident_tabs(); self._refresh_resident_archive_list(); self._save_all()
         for i in range(self.residentTabs.count()):
-             if self.residentTabs.tabText(i) == orig_cat:
-                 self.residentTabs.setCurrentIndex(i)
-                 break
-        
+            if self.residentTabs.tabText(i) == orig_cat:
+                self.residentTabs.setCurrentIndex(i); break
+
     def _delete_resident_archive_item(self):
         row = self.residentArchiveList.currentRow()
         archive_item = self._get_resident_archive_item(row)
         if not archive_item: return
-
         if QtWidgets.QMessageBox.question(self, "削除確認", f"アーカイブ項目「{archive_item['title']}」を完全に削除しますか？") != QtWidgets.QMessageBox.Yes:
             return
-
         orig_cat = archive_item.get("original_category")
         if not orig_cat or orig_cat not in self.state["categories"]:
-             # 念のため全カテゴリから削除を試みる
             for cat_data in self.state["categories"].values():
-                 cat_data["archive"] = [it for it in cat_data.get("archive", []) if it["id"] != archive_item["id"]]
+                cat_data["archive"] = [it for it in cat_data.get("archive", []) if it["id"] != archive_item["id"]]
         else:
-            self.state["categories"][orig_cat]["archive"] = [
-                it for it in self.state["categories"][orig_cat]["archive"] if it["id"] != archive_item["id"]
-            ]
-        
-        self._refresh_resident_archive_list()
-        self._save_all()
+            self.state["categories"][orig_cat]["archive"] = [it for it in self.state["categories"][orig_cat]["archive"] if it["id"] != archive_item["id"]]
+        self._refresh_resident_archive_list(); self._save_all()
 
     def _edit_resident_archive_item(self, item: QtWidgets.QListWidgetItem):
-        # ToDoアーカイブと同様に、タイトルと本文（プレーンテキスト）を編集可能にする
         row = self.residentArchiveList.currentRow()
         target = self._get_resident_archive_item(row)
         if not target: return
-        
-        # 1. タイトル
         new_title, ok = QtWidgets.QInputDialog.getText(self, "アーカイブのタイトル", "タイトル：", text=target.get("title",""))
         if not ok: return
-        
-        # 2. 本文（簡易）
         dlg = QtWidgets.QInputDialog(self); dlg.setWindowTitle("アーカイブの本文（プレーンテキスト）")
-        dlg.setLabelText("本文：")
-        dlg.setTextValue(html_to_plain(target.get("html","")))
-        
+        dlg.setLabelText("本文："); dlg.setTextValue(html_to_plain(target.get("html","")))
         if dlg.exec() == QtWidgets.QDialog.Accepted:
-            body_plain = dlg.textValue()
-            body_html = plain_to_html(body_plain)
-            
-            # 該当IDのアイテムを探して更新
-            found = False
+            body_plain = dlg.textValue(); body_html = plain_to_html(body_plain)
             for cat_data in self.state["categories"].values():
                 for it in cat_data.get("archive", []):
                     if it["id"] == target["id"]:
-                        it["title"] = new_title
-                        it["html"] = body_html
-                        found = True
-                        break
-                if found: break
-                
-            self._refresh_resident_archive_list()
-            self._save_all()
-
+                        it["title"] = new_title; it["html"] = body_html; break
+            self._refresh_resident_archive_list(); self._save_all()
 
     # --- セレクション → 詳細に読み込み ---
     def _on_todo_selected(self, current: QtCore.QModelIndex, previous: QtCore.QModelIndex):
         self._load_detail(("todo", current.row()) if current.isValid() else None)
+        self._save_last_state()
 
     def _on_resident_selected(self, cat_name: str, row: int):
         self._load_detail(("resident", cat_name, row) if row >= 0 else None)
+        self._save_last_state()
 
     # --- 詳細欄ロード／保存 ---
     def _load_detail(self, ref: Optional[Tuple]):
@@ -931,34 +895,25 @@ class MainWindow(QtWidgets.QMainWindow):
         self._detail_ref = ref
         if ref is None:
             self.detailLabel.setText("詳細")
-            self.detailEditor.blockSignals(True)
-            self.detailEditor.clear()
+            self.detailEditor.blockSignals(True); self.detailEditor.clear()
             self.detailEditor.setPlaceholderText("ToDo または 常駐事項の項目を選択すると、ここで詳細編集できます。")
-            self.detailEditor.blockSignals(False)
-            return
+            self.detailEditor.blockSignals(False); return
         if ref[0] == "todo":
             row = ref[1]
             if 0 <= row < len(self.state["todo"]["items"]):
                 it = self.state["todo"]["items"][row]
-                title = it.get("title", "")
-                self.detailLabel.setText(f"詳細（ToDo / {title}）")
-                self.detailEditor.blockSignals(True)
-                self.detailEditor.setHtml(it.get("html", ""))
-                self.detailEditor.blockSignals(False)
+                self.detailLabel.setText(f"詳細（ToDo / {it.get('title','')}）")
+                self.detailEditor.blockSignals(True); self.detailEditor.setHtml(it.get("html", "")); self.detailEditor.blockSignals(False)
         else:
             _, cat, row = ref
             items = self.state["categories"].get(cat, {}).get("items", [])
             if 0 <= row < len(items):
                 it = items[row]
                 self.detailLabel.setText(f"詳細（{cat} / {it.get('title','無題')}）")
-                self.detailEditor.blockSignals(True)
-                self.detailEditor.setHtml(it.get("html",""))
-                self.detailEditor.blockSignals(False)
+                self.detailEditor.blockSignals(True); self.detailEditor.setHtml(it.get("html","")); self.detailEditor.blockSignals(False)
 
     def _apply_detail_to_state(self):
-        if not self._detail_ref:
-            return
-        # ★ 保存直前に外部参照を dataURL に置換
+        if not hasattr(self, "_detail_ref") or not self._detail_ref: return
         html = inline_external_images(self.detailEditor.toHtml())
         if self._detail_ref[0] == "todo":
             row = self._detail_ref[1]
@@ -974,10 +929,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # --- カテゴリ（タブ）操作 ---
     def _on_resident_tab_moved(self, from_idx: int, to_idx: int):
-        # アーカイブタブは移動対象外なので、通常タブの移動のみを反映する
         new_order = [self.residentTabs.tabText(i) for i in range(self.residentTabs.count()) if self.residentTabs.tabText(i) != "アーカイブ"]
-        self.state["category_order"] = new_order
-        self._save_all()
+        self.state["category_order"] = new_order; self._save_all(); self._save_last_state()
 
     def _add_resident_tab(self):
         name, ok = QtWidgets.QInputDialog.getText(self, "カテゴリの追加", "カテゴリ名：")
@@ -991,7 +944,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for i in range(self.residentTabs.count()):
             if self.residentTabs.tabText(i) == name:
                 self.residentTabs.setCurrentIndex(i); break
-        self._save_all()
+        self._save_all(); self._save_last_state()
 
     def _rename_resident_tab(self):
         cur = self.residentTabs.currentIndex()
@@ -999,27 +952,22 @@ class MainWindow(QtWidgets.QMainWindow):
         old = self.residentTabs.tabText(cur)
         if old == "アーカイブ":
             QtWidgets.QMessageBox.warning(self, "エラー", "アーカイブタブの名前は変更できません。"); return
-            
         new, ok = QtWidgets.QInputDialog.getText(self, "カテゴリ名の変更", "新しい名前：", text=old)
         if not ok: return
         new = new.strip()
         if not new or new == old: return
         if new in self.state["categories"]:
             QtWidgets.QMessageBox.warning(self, "重複", "同名のカテゴリが既にあります。"); return
-            
-        # データの更新
         self.state["categories"][new] = self.state["categories"].pop(old)
         self.state["category_order"] = [new if x == old else x for x in self.state["category_order"]]
-        # アーカイブデータ内のoriginal_categoryも更新
-        for arc_item in self.state["categories"][new]["archive"]:
-            if arc_item.get("original_category") == old:
-                arc_item["original_category"] = new
-        
+        for arc in self.state["categories"][new]["archive"]:
+            if arc.get("original_category") == old:
+                arc["original_category"] = new
         self._rebuild_resident_tabs()
         for i in range(self.residentTabs.count()):
             if self.residentTabs.tabText(i) == new:
                 self.residentTabs.setCurrentIndex(i); break
-        self._save_all()
+        self._save_all(); self._save_last_state()
 
     def _delete_resident_tab(self):
         cur = self.residentTabs.currentIndex()
@@ -1027,16 +975,14 @@ class MainWindow(QtWidgets.QMainWindow):
         name = self.residentTabs.tabText(cur)
         if name == "アーカイブ":
             QtWidgets.QMessageBox.warning(self, "エラー", "アーカイブタブは削除できません。"); return
-        
         if QtWidgets.QMessageBox.question(self, "削除確認", f"カテゴリ「{name}」を削除しますか？\n（項目とアーカイブ項目も全て消えます）") != QtWidgets.QMessageBox.Yes:
             return
-            
         self.state["categories"].pop(name, None)
         self.state["category_order"] = [x for x in self.state["category_order"] if x != name]
         self._rebuild_resident_tabs()
-        if self._detail_ref and self._detail_ref[0] == "resident" and self._detail_ref[1] == name:
+        if hasattr(self, "_detail_ref") and self._detail_ref and self._detail_ref[0] == "resident" and self._detail_ref[1] == name:
             self._load_detail(None)
-        self._save_all()
+        self._save_all(); self._save_last_state()
 
     # ----- Global style -----
     def _apply_global_style(self):
@@ -1076,9 +1022,8 @@ class MainWindow(QtWidgets.QMainWindow):
         avail = QtGui.QGuiApplication.primaryScreen().availableGeometry()
         cur = self.geometry()
         target_w, target_h = int(avail.width()*0.7), int(avail.height()*0.7)
-        near_70 = abs(cur.width()-target_w) <= int(avail.width()*0.02) and \
-                  abs(cur.height()-target_h) <= int(avail.height()*0.02)
-        if near_70 and self.prev_geometry:
+        near_70 = abs(cur.width()-target_w) <= int(avail.width()*0.02) and abs(cur.height()-target_h) <= int(avail.height()*0.02)
+        if near_70 and hasattr(self, "prev_geometry") and self.prev_geometry:
             self.setGeometry(self.prev_geometry); self.prev_geometry = None
         else:
             self.prev_geometry = QtCore.QRect(cur)
@@ -1093,14 +1038,11 @@ class MainWindow(QtWidgets.QMainWindow):
         menu = QtWidgets.QMenu()
         act_show = menu.addAction("表示／前面へ"); act_hide = menu.addAction("最小化")
         menu.addSeparator()
-        self.actTrayOnTop = menu.addAction("常に手前に表示")
-        self.actTrayOnTop.setCheckable(True)
-        self.actTrayOnTop.setChecked(False)
+        self.actTrayOnTop = menu.addAction("常に手前に表示"); self.actTrayOnTop.setCheckable(True); self.actTrayOnTop.setChecked(False)
         self.actTrayOnTop.toggled.connect(self._toggle_always_on_top)
         menu.addSeparator()
         act_quit = menu.addAction("終了")
-        act_show.triggered.connect(self._bring_front); act_hide.triggered.connect(self.showMinimized)
-        act_quit.triggered.connect(QtWidgets.QApplication.quit)
+        act_show.triggered.connect(self._bring_front); act_hide.triggered.connect(self.showMinimized); act_quit.triggered.connect(QtWidgets.QApplication.quit)
         self.tray.setContextMenu(menu); self.tray.setToolTip(APP_TITLE); self.tray.show()
 
     # ----- Always on Top -----
@@ -1157,10 +1099,10 @@ class MainWindow(QtWidgets.QMainWindow):
         text = self.todoInput.text().strip()
         if not text: return
         self.todoModel.add(text); self.todoInput.clear(); self._save_all()
-        # 追加直後に選択 & 詳細へ
         row = self.todoModel.rowCount() - 1
         self.todoList.setCurrentIndex(self.todoModel.index(row))
         self._load_detail(("todo", row))
+        self._save_last_state()
 
     def _selected_row(self):
         idx = self.todoList.currentIndex()
@@ -1176,6 +1118,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if row >= 0:
             self.todoModel.remove(row); self._save_all()
             self._load_detail(None)
+            self._save_last_state()
 
     def _rename_selected_todo(self):
         row = self._selected_row()
@@ -1185,33 +1128,48 @@ class MainWindow(QtWidgets.QMainWindow):
         if not ok: return
         new = new.strip()
         if not new: return
+        # 実体を書き換え & モデルへ通知
         self.state["todo"]["items"][row]["title"] = new
         self.todoModel.dataChanged.emit(self.todoModel.index(row), self.todoModel.index(row))
-        if self._detail_ref and self._detail_ref[0] == "todo" and self._detail_ref[1] == row:
+        if hasattr(self, "_detail_ref") and self._detail_ref and self._detail_ref[0] == "todo" and self._detail_ref[1] == row:
             self.detailLabel.setText(f"詳細（ToDo / {new}）")
+        self._save_all()
+
+    def _pick_color_for_selected_todo(self):
+        row = self._selected_row()
+        if row < 0: return
+        menu = QtWidgets.QMenu(self)
+        choices = [
+            ("色なし（クリア）", None),
+            ("赤（緊急）", "#ffcccc"),
+            ("橙（高）", "#ffe5cc"),
+            ("黄（中）", "#fff8c6"),
+            ("緑（低）", "#e7ffd9"),
+            ("青（情報）", "#e4f0ff"),
+        ]
+        for label, col in choices:
+            act = menu.addAction(label); act.setData(col)
+        picked = menu.exec(QtGui.QCursor.pos())
+        if not picked: return
+        col = picked.data()
+        self.state["todo"]["items"][row]["color"] = col
+        self.todoModel.dataChanged.emit(self.todoModel.index(row), self.todoModel.index(row))
         self._save_all()
 
     # ----- ToDo Archive -----
     def _edit_archive_item(self, item: QtWidgets.QListWidgetItem):
-        # アーカイブはタイトル/本文の編集（ダイアログ）
         row = self.archiveList.row(item)
         sorted_arc = sorted(self.state["todo"]["archive"], key=lambda x: x.get("archived_at", 0), reverse=True)
         target = sorted_arc[row]
-        # タイトル
         new_title, ok = QtWidgets.QInputDialog.getText(self, "アーカイブのタイトル", "タイトル：", text=target.get("title",""))
         if not ok: return
-        # 本文（簡易）
         dlg = QtWidgets.QInputDialog(self); dlg.setWindowTitle("アーカイブの本文（プレーンテキスト）")
-        dlg.setLabelText("本文：")
-        dlg.setTextValue(html_to_plain(target.get("html","")))
+        dlg.setLabelText("本文："); dlg.setTextValue(html_to_plain(target.get("html","")))
         if dlg.exec() == QtWidgets.QDialog.Accepted:
-            body_plain = dlg.textValue()
-            body_html = plain_to_html(body_plain)
+            body_plain = dlg.textValue(); body_html = plain_to_html(body_plain)
             for it in self.state["todo"]["archive"]:
                 if it["id"] == target["id"]:
-                    it["title"] = new_title
-                    it["html"] = body_html
-                    break
+                    it["title"] = new_title; it["html"] = body_html; break
             self._refresh_todo_archive_list(); self._save_all()
 
     def _archive_done(self):
@@ -1222,13 +1180,14 @@ class MainWindow(QtWidgets.QMainWindow):
         for it in done:
             self.state["todo"]["archive"].append({
                 "id": it["id"], "title": it.get("title",""), "archived_at": now,
-                "html": it.get("html", "")
+                "html": it.get("html", ""), "color": it.get("color"),
             })
         self.state["todo"]["items"] = [it for it in self.state["todo"]["items"] if not it.get("done")]
         self.todoModel.layoutChanged.emit()
         self._refresh_todo_archive_list()
         self._save_all()
         self.centerTabs.setCurrentIndex(1)
+        self._save_last_state()
 
     def _delete_selected_todo_archive(self):
         row = self.archiveList.currentRow()
@@ -1242,19 +1201,91 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _refresh_todo_archive_list(self):
         self.archiveList.clear()
-        for it in sorted(self.state["todo"]["archive"], key=lambda x: x.get("archived_at", 0), reverse=True):
+        sorted_arc = sorted(self.state["todo"]["archive"], key=lambda x: x.get("archived_at", 0), reverse=True)
+        for it in sorted_arc:
             ts = QtCore.QDateTime.fromSecsSinceEpoch(it.get("archived_at", 0)).toString("yyyy-MM-dd HH:mm")
-            self.archiveList.addItem(f"{ts}  -  {it.get('title','')}")
+            item = QtWidgets.QListWidgetItem(f"{ts}  -  {it.get('title','')}")
+            col = it.get("color")
+            if col: item.setBackground(QtGui.QBrush(QtGui.QColor(col)))
+            self.archiveList.addItem(item)
+
+    def _show_archive_context_menu(self, pos: QtCore.QPoint):
+        row = self.archiveList.currentRow()
+        if row < 0: return
+        menu = QtWidgets.QMenu(self)
+        choices = [
+            ("色なし（クリア）", None),
+            ("赤（緊急）", "#ffcccc"),
+            ("橙（高）", "#ffe5cc"),
+            ("黄（中）", "#fff8c6"),
+            ("緑（低）", "#e7ffd9"),
+            ("青（情報）", "#e4f0ff"),
+        ]
+        for label, col in choices:
+            act = menu.addAction(label); act.setData(col)
+        picked = menu.exec(self.archiveList.mapToGlobal(pos))
+        if not picked: return
+        sorted_arc = sorted(self.state["todo"]["archive"], key=lambda x: x.get("archived_at", 0), reverse=True)
+        target = sorted_arc[row]
+        for it in self.state["todo"]["archive"]:
+            if it["id"] == target["id"]:
+                it["color"] = picked.data(); break
+        self._refresh_todo_archive_list(); self._save_all()
 
     # ----- フリースペース -----
     def _on_free_html_changed(self):
-        # 保存直前に外部参照を dataURL に置換
         self.state["memo2"]["html"] = inline_external_images(self.memoFree.toHtml())
         self._save_all()
 
     # ----- 共通 -----
+    def _save_editor_bg(self, key: str, col: QtGui.QColor):
+        bg = self.conf.get("editor_bg", {})
+        bg[key] = col.name()
+        self.conf["editor_bg"] = bg
+        save_json(CONF_FILE, self.conf)
+
+    def _save_last_state(self):
+        last = self.conf.get("last", {})
+        last["center_tab"] = self.centerTabs.currentIndex()
+        idx = self.todoList.currentIndex()
+        last["todo_row"] = idx.row() if idx.isValid() else -1
+        rt_idx = self.residentTabs.currentIndex()
+        rt_name = self.residentTabs.tabText(rt_idx) if rt_idx >= 0 else None
+        last["resident_tab"] = rt_name
+        resident_row = -1
+        if rt_name and rt_name != "アーカイブ":
+            cat_widget = self.residentTabs.widget(rt_idx)
+            lst = cat_widget.findChild(QtWidgets.QListWidget, f"list_{rt_name}")
+            if lst:
+                resident_row = lst.currentRow()
+        last["resident_row"] = resident_row
+        self.conf["last"] = last
+        save_json(CONF_FILE, self.conf)
+
+    def _restore_last_state(self):
+        last = self.conf.get("last", {})
+        ct = int(last.get("center_tab", 0)); ct = 0 if ct not in (0,1) else ct
+        self.centerTabs.setCurrentIndex(ct)
+        tr = int(last.get("todo_row", -1))
+        if 0 <= tr < self.todoModel.rowCount():
+            self.todoList.setCurrentIndex(self.todoModel.index(tr))
+            self._load_detail(("todo", tr))
+        rt_name = last.get("resident_tab")
+        if rt_name:
+            for i in range(self.residentTabs.count()):
+                if self.residentTabs.tabText(i) == rt_name:
+                    self.residentTabs.setCurrentIndex(i); break
+            rr = int(last.get("resident_row", -1))
+            if rt_name != "アーカイブ" and rr >= 0:
+                cat_widget = self.residentTabs.currentWidget()
+                lst = cat_widget.findChild(QtWidgets.QListWidget, f"list_{rt_name}")
+                if lst and rr < lst.count():
+                    lst.setCurrentRow(rr)
+                    self._on_resident_selected(rt_name, rr)
+
     def _bring_front(self):
         self.showNormal(); self.raise_(); self.activateWindow()
+
     def _save_all(self):
         save_json(DATA_FILE, self.state)
 
