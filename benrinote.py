@@ -108,9 +108,32 @@ class SeparatorDelegate(QtWidgets.QStyledItemDelegate):
         y = option.rect.bottom() - 1
         painter.drawLine(option.rect.left() + 6, y, option.rect.right() - 6, y)
         painter.restore()
+        
     def sizeHint(self, option, index):
         sz = super().sizeHint(option, index)
         return QtCore.QSize(sz.width(), max(sz.height(), 24))
+
+    # ▼ 編集時にテキストが消えないようにするロジックを統合
+    def createEditor(self, parent: QtWidgets.QWidget, option: QtWidgets.QStyleOptionViewItem, index: QtCore.QModelIndex):
+        editor = QtWidgets.QLineEdit(parent)
+        return editor
+
+    def setEditorData(self, editor: QtWidgets.QWidget, index: QtCore.QModelIndex):
+        if isinstance(editor, QtWidgets.QLineEdit):
+            text = index.data(QtCore.Qt.DisplayRole)
+            if text:
+                editor.setText(text)
+            else:
+                editor.clear()
+        else:
+            super().setEditorData(editor, index)
+
+    def updateEditorGeometry(self, editor: QtWidgets.QWidget, option: QtWidgets.QStyleOptionViewItem, index: QtCore.QModelIndex):
+        """エディタのサイズをリスト項目に合わせる"""
+        rect = option.rect
+        rect.adjust(6, 2, -6, -2) 
+        editor.setGeometry(rect)
+
 
 class EmbedImageTextEdit(QtWidgets.QTextEdit):
     def canInsertFromMimeData(self, source: QtCore.QMimeData) -> bool:
@@ -451,7 +474,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setWindowTitle(APP_TITLE)
         self.setWindowIcon(QtGui.QIcon.fromTheme("sticky-notes"))
         self.prev_geometry: Optional[QtCore.QRect] = None
-        self._detail_ref_uuid: Optional[str] = None # 📌 追加: 常駐事項の選択UUIDを保持
+        self._detail_ref_uuid: Optional[str] = None # 📌 常駐事項の選択UUIDを保持
 
         self.state = load_json(DATA_FILE, DEFAULT_STATE)
         self.conf = load_json(CONF_FILE, {"geometry": None})
@@ -604,7 +627,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # ===== 左：常駐カテゴリ（タブ） =====
         self.residentTabs = QtWidgets.QTabWidget()
         self.residentTabs.setTabsClosable(False)
-        self.residentTabs.tabBar().setMovable(True)
+        self.residentTabs.setMovable(True)
         self.residentTabs.tabBar().installEventFilter(self)
 
         btnAddCat = QtWidgets.QToolButton(); btnAddCat.setText("＋"); btnAddCat.clicked.connect(self._add_resident_tab)
@@ -692,38 +715,56 @@ class MainWindow(QtWidgets.QMainWindow):
     # ====== 常駐カテゴリ UI ======
     def _rebuild_resident_tabs(self):
         self.residentTabs.blockSignals(True)
-        current_text = self.residentTabs.tabText(self.residentTabs.currentIndex()) if self.residentTabs.count() else None
 
+        current_text = None
+        if self.residentTabs.count() > 0:
+            current_text = self.residentTabs.tabText(self.residentTabs.currentIndex())
+
+        # ---- すべてクリアして再構築 ----
         self.residentTabs.clear()
+
+        # 順序リストを再構成（古いカテゴリも落とさない）
         order = list(self.state.get("category_order", []))
         for k in self.state["categories"].keys():
-            if k not in order: order.append(k)
+            if k not in order:
+                order.append(k)
         self.state["category_order"] = order
 
-        new_index = 0
+        # 通常カテゴリを追加
         for name in order:
             self.residentTabs.addTab(self._build_category_widget(name), name)
-            if name == current_text:
-                new_index = self.residentTabs.count() - 1
 
-        if order:
-            self.residentTabs.addTab(self._build_resident_archive_widget(), "アーカイブ")
+        # ★ ここでアーカイブタブを追加（常に最後）
+        self.residentTabs.addTab(self._build_resident_archive_widget(), "アーカイブ")
 
-        # タブの移動シグナルを再接続
+        # アーカイブタブもちゃんと押せるように
+        self.residentTabs.setTabsClosable(False)
+        self.residentTabs.setMovable(True)
+
+        # tabMovedシグナル再接続（重複防止）
         try:
-             self.residentTabs.tabBar().tabMoved.disconnect()
+            self.residentTabs.tabBar().tabMoved.disconnect()
         except TypeError:
-             pass
+            pass
         self.residentTabs.tabBar().tabMoved.connect(self._on_resident_tab_moved)
 
-        if current_text == "アーカイブ":
-            self.residentTabs.setCurrentIndex(self.residentTabs.count() - 1)
-        elif new_index < self.residentTabs.count():
-            self.residentTabs.setCurrentIndex(new_index)
+        # ---- 選択復元 ----
+        # 直前に開いていたタブを再選択（なければ一番前）
+        restored = False
+        if current_text:
+            for i in range(self.residentTabs.count()):
+                if self.residentTabs.tabText(i) == current_text:
+                    self.residentTabs.setCurrentIndex(i)
+                    restored = True
+                    break
+        if not restored and self.residentTabs.count() > 0:
+            self.residentTabs.setCurrentIndex(0)
+
         self.residentTabs.blockSignals(False)
 
     def _build_category_widget(self, cat_name: str) -> QtWidgets.QWidget:
         wrap = QtWidgets.QWidget()
+        wrap.setProperty("cat_name", cat_name) 
         v = QtWidgets.QVBoxLayout(wrap); v.setContentsMargins(6,6,6,6); v.setSpacing(6)
 
         lst = ResidentListWidget(cat_name, self, objectName=f"list_{cat_name}") 
@@ -903,7 +944,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self._save_last_state()
             
             # 🌟 最重要修正: 並び替え後、選択中の項目（UUIDベース）を再ロードする
-            # これにより、並び替え前のインデックスで読み書きされる問題を回避
             
             current_row = list_widget.currentRow()
             if current_row >= 0:
@@ -1005,15 +1045,28 @@ class MainWindow(QtWidgets.QMainWindow):
         self._load_detail(("todo", current.row()) if current.isValid() else None)
         self._save_last_state()
 
-    # 🌟 修正: 常駐事項選択時のロジック変更
+    # 🌟 修正: 常駐事項選択時のロジック変更 
     def _on_resident_selected(self, cat_name: str, row: int):
         # 選択されたリストアイテムからUUIDを取得
         selected_item_uuid = None
-        if row >= 0:
-            current_widget = self.residentTabs.currentWidget()
-            lst = current_widget.findChild(ResidentListWidget, f"list_{cat_name}")
-            if lst and lst.item(row):
-                selected_item_uuid = lst.item(row).data(QtCore.Qt.UserRole)
+        
+        # 👇 修正: 現在アクティブなタブではなく、cat_nameに対応するタブウィジェットを探す
+        current_tab_index = -1
+        for i in range(self.residentTabs.count()):
+            if self.residentTabs.tabText(i) == cat_name:
+                current_tab_index = i
+                break
+                
+        if current_tab_index >= 0:
+            # 適切なカテゴリのタブウィジェットを取得
+            current_widget = self.residentTabs.widget(current_tab_index) 
+            
+            # タブウィジェット内でリストウィジェットを検索
+            if current_widget:
+                lst = current_widget.findChild(ResidentListWidget, f"list_{cat_name}")
+            
+                if lst and lst.item(row):
+                    selected_item_uuid = lst.item(row).data(QtCore.Qt.UserRole)
         
         self._detail_ref_uuid = selected_item_uuid # 選択UUIDを保持
         
@@ -1021,7 +1074,7 @@ class MainWindow(QtWidgets.QMainWindow):
             # UUIDを引数に渡して詳細をロード
             self._load_detail(("resident", cat_name, selected_item_uuid))
         else:
-            self._load_detail(None)
+            self._load_detail(None) # データが見つからない場合はクリア
             
         self._save_last_state()
 
@@ -1056,8 +1109,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.detailLabel.setText(f"詳細（{cat} / {item_data.get('title','無題')}）")
                 self.detailEditor.blockSignals(True); self.detailEditor.setHtml(item_data.get("html","")); self.detailEditor.blockSignals(False)
             else:
-                self._load_detail(None) # データが見つからない場合はクリア
-                
+                self.detailEditor.blockSignals(True); self.detailEditor.clear(); self.detailEditor.setPlaceholderText("データが見つかりません"); self.detailEditor.blockSignals(False)
+
 
     def _apply_detail_to_state(self):
         # 🌟 修正: detail_ref が存在しない場合は何もしない
@@ -1086,11 +1139,43 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # --- カテゴリ（タブ）操作 ---
     def _on_resident_tab_moved(self, from_idx: int, to_idx: int):
-        # 🌟 修正: タブを移動する前に、現在の詳細エディタの内容を保存
-        self._apply_detail_to_state()
-        
-        new_order = [self.residentTabs.tabText(i) for i in range(self.residentTabs.count()) if self.residentTabs.tabText(i) != "アーカイブ"]
-        self.state["category_order"] = new_order; self._save_all(); self._save_last_state()
+        # 二重実行ガード（再構築で連鎖しないように）
+        if getattr(self, "_tab_move_in_progress", False):
+            return
+        self._tab_move_in_progress = True
+        try:
+            # 編集中の内容を保存
+            self._apply_detail_to_state()
+
+            tb = self.residentTabs.tabBar()
+
+            # 「アーカイブ」が関与した移動は許可しない（見た目を元に戻す）
+            if tb.tabText(from_idx) == "アーカイブ" or tb.tabText(to_idx) == "アーカイブ":
+                tb.moveTab(to_idx, from_idx)
+                return
+
+            # いま表示されている順で category_order を更新（アーカイブ除外）
+            new_order = []
+            for i in range(self.residentTabs.count()):
+                name = self.residentTabs.tabText(i)
+                if name != "アーカイブ":
+                    new_order.append(name)
+            self.state["category_order"] = new_order
+            self._save_all()
+            self._save_last_state()
+
+            # ★再構築でラベルと中身のズレを常に解消
+            current_name = tb.tabText(self.residentTabs.currentIndex()) if self.residentTabs.count() else None
+            self._rebuild_resident_tabs()
+            if current_name:
+                for i in range(self.residentTabs.count()):
+                    if self.residentTabs.tabText(i) == current_name:
+                        self.residentTabs.setCurrentIndex(i)
+                        break
+        finally:
+            self._tab_move_in_progress = False
+
+
 
     def _add_resident_tab(self):
         name, ok = QtWidgets.QInputDialog.getText(self, "カテゴリの追加", "カテゴリ名：")
@@ -1099,8 +1184,11 @@ class MainWindow(QtWidgets.QMainWindow):
         if name in self.state["categories"]:
             QtWidgets.QMessageBox.warning(self, "重複", "同名のカテゴリが既にあります。"); return
         self.state["categories"][name] = {"items": [], "archive": []}
-        self.state["category_order"].append(name)
+        # タブ順序のリストを更新する（再構築時に反映される）
+        self.state["category_order"].append(name) 
         self._rebuild_resident_tabs()
+        
+        # 新しいタブに切り替える（アーカイブタブの前の位置）
         for i in range(self.residentTabs.count()):
             if self.residentTabs.tabText(i) == name:
                 self.residentTabs.setCurrentIndex(i); break
@@ -1183,9 +1271,18 @@ class MainWindow(QtWidgets.QMainWindow):
         """)
 
     # ----- Event / Window flags -----
+    # 📌 修正: イベントフィルターでタブ移動を制御し、アーカイブタブを固定する
     def eventFilter(self, obj, ev):
+        # ツールバーのダブルクリックでサイズ変更
         if obj is self.topBar and ev.type() == QtCore.QEvent.MouseButtonDblClick:
             self._toggle_size_70(); return True
+                
+        # QTabBar のタブ移動イベントで、アーカイブタブが動いた場合にキャンセルする（念のため）
+        if obj is self.residentTabs.tabBar() and ev.type() == QtCore.QEvent.MouseMove:
+            tab_bar = obj
+            # 移動中のタブがアーカイブかどうかを判断するのは困難なため、MouseButtonPress で対処するのが確実。
+            # ここでは何もしない
+            
         return super().eventFilter(obj, ev)
 
     def _toggle_size_70(self):
